@@ -1,7 +1,11 @@
+import {
+  WRITE_BROWSER_ACTIONS,
+  normalizeBrowserAction,
+} from "./browser-protocol.js";
+
 const ACTIVE_TAB_CONTEXT_EVENT = "sidebar:active-tab-context-updated";
 const TAB_CONTEXT_BROADCAST_DELAY_MS = 150;
 const POST_ACTION_SNAPSHOT_DELAY_MS = 450;
-const WRITE_ACTIONS = new Set(["browser.click", "browser.type"]);
 
 let tabContextBroadcastTimer = null;
 let lastBroadcastContextKey = "";
@@ -118,7 +122,12 @@ async function broadcastActiveTabContext() {
 }
 
 async function executeBrowserBridgeAction(action) {
-  const normalizedAction = normalizeAction(action);
+  const normalizedAction = normalizeBrowserAction(action, {
+    allowStringTarget: false,
+    allowSelectorTarget: false,
+    allowInternalActions: true,
+    allowLegacyTopLevelTargetFields: true,
+  });
   if (!normalizedAction) {
     return {
       ok: false,
@@ -136,7 +145,7 @@ async function executeBrowserBridgeAction(action) {
 
   const authorization = buildPageAuthorization(tab);
   if (
-    WRITE_ACTIONS.has(normalizedAction.action) &&
+    WRITE_BROWSER_ACTIONS.has(normalizedAction.action) &&
     !grantedPageAuthorizations.has(authorization.pageKey)
   ) {
     return {
@@ -148,7 +157,7 @@ async function executeBrowserBridgeAction(action) {
   }
 
   const response = await dispatchActionToTab(tab.id, normalizedAction);
-  if (WRITE_ACTIONS.has(normalizedAction.action)) {
+  if (WRITE_BROWSER_ACTIONS.has(normalizedAction.action)) {
     const snapshot = await collectPostActionSnapshot(tab.id);
     return attachSnapshotToResponse(response, snapshot, authorization);
   }
@@ -281,59 +290,6 @@ function buildPageAuthorization(tab) {
     title: tab.title || "",
     url: canonicalUrl || tab.url || "",
   };
-}
-
-function normalizeAction(action) {
-  if (!action || typeof action !== "object") {
-    return null;
-  }
-
-  const actionType =
-    typeof action.action === "string"
-      ? action.action.trim()
-      : typeof action.type === "string"
-        ? action.type.trim()
-        : "";
-
-  if (!actionType) {
-    return null;
-  }
-
-  const normalized = {
-    action: actionType,
-  };
-
-  if (action.target && typeof action.target === "object") {
-    normalized.target = {};
-    if (typeof action.target.elementId === "string" && action.target.elementId.trim()) {
-      normalized.target.elementId = action.target.elementId.trim();
-    }
-    if (typeof action.target.selector === "string" && action.target.selector.trim()) {
-      normalized.target.selector = action.target.selector.trim();
-    }
-  }
-
-  if (typeof action.elementId === "string" && action.elementId.trim()) {
-    normalized.target = normalized.target || {};
-    normalized.target.elementId = action.elementId.trim();
-  }
-
-  if (typeof action.selector === "string" && action.selector.trim()) {
-    normalized.target = normalized.target || {};
-    normalized.target.selector = action.selector.trim();
-  }
-
-  if (typeof action.text === "string") {
-    normalized.text = action.text;
-  }
-  if (action.clear === false) {
-    normalized.clear = false;
-  }
-  if (action.submit === true) {
-    normalized.submit = true;
-  }
-
-  return normalized;
 }
 
 function attachSnapshotToResponse(response, snapshot, authorization) {

@@ -1,3 +1,5 @@
+import { inspectBrowserActionFromContent } from "./browser-protocol.js";
+
 const DEFAULT_CONFIG = {
   gatewayWsUrl: "ws://127.0.0.1:18790/pico/ws",
   gatewayPicoToken: "",
@@ -11,17 +13,8 @@ const SESSION_SAVE_DELAY_MS = 250;
 const MESSAGE_COPY_RESET_DELAY_MS = 1600;
 const MESSAGE_BOTTOM_THRESHOLD_PX = 24;
 const DEFAULT_THREAD_TITLE = "New Chat";
-const MAX_PROMPT_SNAPSHOT_ELEMENTS = 12;
-const MAX_RENDERED_SNAPSHOT_ELEMENTS = 14;
-const BROWSER_ACTION_BLOCK_REGEX = /```browser-action\s*([\s\S]*?)```/i;
-const JSON_CODE_BLOCK_REGEX = /```(?:json)?\s*([\s\S]*?)```/gi;
-const SUPPORTED_BROWSER_ACTIONS = new Set([
-  "browser.snapshot",
-  "browser.extract",
-  "browser.find",
-  "browser.click",
-  "browser.type",
-]);
+const MAX_BROWSER_ACTION_HISTORY = 10;
+const MAX_PROMPT_ACTION_HISTORY = 2;
 const MESSAGE_COPY_ICON = `
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <rect x="9" y="9" width="10" height="10" rx="2"></rect>
@@ -44,8 +37,8 @@ const state = {
   historySyncPromises: {},
   settingsExpanded: false,
   browserSnapshots: {},
-  browserSnapshotStatus: {},
   browserActionRequests: {},
+  browserActionHistory: {},
   grantedPageKeys: {},
 };
 
@@ -58,22 +51,10 @@ const elements = {
   settingsToggle: document.querySelector("#settings-toggle"),
   connectToggle: document.querySelector("#connect-toggle"),
   refreshContext: document.querySelector("#refresh-context"),
-  refreshSnapshot: document.querySelector("#refresh-snapshot"),
   bridgeStatus: document.querySelector("#bridge-status"),
   connectionStatus: document.querySelector("#connection-status"),
   connectionSummary: document.querySelector("#connection-summary"),
-  snapshotStatus: document.querySelector("#snapshot-status"),
   tabContext: document.querySelector("#tab-context"),
-  browserSnapshot: document.querySelector("#browser-snapshot"),
-  pendingBrowserAction: document.querySelector("#pending-browser-action"),
-  pendingBrowserActionTitle: document.querySelector(
-    "#pending-browser-action-title",
-  ),
-  pendingBrowserActionSummary: document.querySelector(
-    "#pending-browser-action-summary",
-  ),
-  approveBrowserAction: document.querySelector("#approve-browser-action"),
-  rejectBrowserAction: document.querySelector("#reject-browser-action"),
   messages: document.querySelector("#messages"),
   jumpToLatest: document.querySelector("#jump-to-latest"),
   typingIndicator: document.querySelector("#typing-indicator"),
@@ -101,8 +82,6 @@ async function bootstrap() {
   renderSession();
   renderMessages();
   renderTyping();
-  renderBrowserSnapshot();
-  renderPendingBrowserAction();
   await refreshTabContext();
 }
 
@@ -152,10 +131,6 @@ function bindEvents() {
     void refreshTabContext();
   });
 
-  elements.refreshSnapshot.addEventListener("click", () => {
-    void refreshBrowserSnapshot();
-  });
-
   elements.connectToggle.addEventListener("click", () => {
     if (state.shouldMaintainConnections) {
       disconnectAllSockets();
@@ -188,14 +163,6 @@ function bindEvents() {
     await chrome.storage.local.set({
       includeTabContext: state.config.includeTabContext,
     });
-  });
-
-  elements.approveBrowserAction.addEventListener("click", () => {
-    void approvePendingBrowserAction();
-  });
-
-  elements.rejectBrowserAction.addEventListener("click", () => {
-    void rejectPendingBrowserAction();
   });
 
   elements.composer.addEventListener("submit", (event) => {
@@ -279,12 +246,8 @@ async function refreshBrowserSnapshot(options = {}) {
   const { silent = false } = options;
   const pageKey = state.activePageKey;
   if (!pageKey) {
-    renderBrowserSnapshot();
     return null;
   }
-
-  setBrowserSnapshotStatus(pageKey, "loading", "Scanning the active page...");
-  renderBrowserSnapshot();
 
   const response = await chrome.runtime.sendMessage({
     type: "browserBridge:executeAction",
@@ -292,12 +255,6 @@ async function refreshBrowserSnapshot(options = {}) {
   });
 
   if (!response?.ok) {
-    setBrowserSnapshotStatus(
-      pageKey,
-      "error",
-      response?.error || "Failed to inspect the active page.",
-    );
-    renderBrowserSnapshot();
     if (!silent) {
       setBridgeStatus(response?.error || "Failed to inspect the active page.");
     }
@@ -309,14 +266,6 @@ async function refreshBrowserSnapshot(options = {}) {
     ...state.browserSnapshots,
     [pageKey]: snapshot,
   };
-  setBrowserSnapshotStatus(
-    pageKey,
-    "ready",
-    snapshot
-      ? `Loaded ${snapshot.elements?.length || 0} interactive elements.`
-      : "The active page returned an empty browser snapshot.",
-  );
-  renderBrowserSnapshot();
   return snapshot;
 }
 
@@ -470,10 +419,12 @@ async function sendMessage() {
 
   const activePageKey = state.activePageKey;
   const snapshot = getActiveBrowserSnapshot();
+  const actionHistory = getBrowserActionHistoryForPage(activePageKey);
   const enrichedContent = buildPrompt(
     raw,
     state.currentTabContext,
     snapshot,
+    actionHistory,
     state.config.includeTabContext,
   );
 
@@ -558,8 +509,6 @@ function applyTabContext(context) {
   renderSession();
   renderMessages();
   renderTyping();
-  renderBrowserSnapshot();
-  renderPendingBrowserAction();
   updateConnectionStateForActivePage();
 
   if (state.shouldMaintainConnections && nextPageKey) {
@@ -655,12 +604,17 @@ function handleIncomingMessage(pageKey, threadId, raw) {
 }
 
 function handleAssistantBrowserAction(pageKey, threadId, messageId, content) {
-  const request = extractBrowserActionFromContent(content);
-  if (!request) {
+  const inspection = inspectBrowserActionFromContent(content);
+  if (inspection.status === "none") {
     return;
   }
 
-  const signature = JSON.stringify(request);
+  const request = inspection.request || { action: "" };
+  const signature = JSON.stringify({
+    status: inspection.status,
+    request,
+    error: inspection.error || null,
+  });
   const existing = state.browserActionRequests[messageId];
   if (existing && existing.signature === signature) {
     return;
@@ -675,18 +629,23 @@ function handleAssistantBrowserAction(pageKey, threadId, messageId, content) {
       threadStorageKey: buildThreadStorageKey(pageKey, threadId),
       request,
       signature,
-      status: "parsed",
+      status: inspection.status === "valid" ? "parsed" : "invalid",
       createdAt: Date.now(),
       updatedAt: Date.now(),
       result: null,
-      error: "",
+      error: inspection.error?.message || "",
+      validation: inspection.error || null,
+      repairSentAt: null,
     },
   };
   renderMessages();
-  renderPendingBrowserAction();
 
   if (buildThreadStorageKey(pageKey, threadId) === getActiveThreadStorageKey()) {
-    void executeBrowserActionRequest(messageId);
+    if (inspection.status === "valid") {
+      void executeBrowserActionRequest(messageId);
+    } else {
+      void sendInvalidBrowserActionRepair(messageId);
+    }
   }
 }
 
@@ -694,6 +653,7 @@ async function executeBrowserActionRequest(messageId) {
   const entry = state.browserActionRequests[messageId];
   if (
     !entry ||
+    entry.status === "invalid" ||
     entry.status === "executing" ||
     entry.threadStorageKey !== getActiveThreadStorageKey()
   ) {
@@ -706,7 +666,6 @@ async function executeBrowserActionRequest(messageId) {
     updatedAt: Date.now(),
   });
   setBridgeStatus(`Running ${entry.request.action} on the active page.`);
-  renderPendingBrowserAction();
   renderMessages();
 
   const response = await chrome.runtime.sendMessage({
@@ -721,7 +680,6 @@ async function executeBrowserActionRequest(messageId) {
       updatedAt: Date.now(),
     });
     setBridgeStatus("Browser action approval is required for this page.");
-    renderPendingBrowserAction();
     renderMessages();
     return;
   }
@@ -737,6 +695,9 @@ async function executeBrowserActionRequest(messageId) {
     if (response?.result?.snapshot && entry.pageKey) {
       setBrowserSnapshotForPage(entry.pageKey, response.result.snapshot);
     }
+    if (response?.result?.actionRecord && entry.pageKey) {
+      appendBrowserActionHistory(entry.pageKey, response.result.actionRecord);
+    }
 
     updateBrowserActionRequest(messageId, {
       status: "error",
@@ -745,8 +706,6 @@ async function executeBrowserActionRequest(messageId) {
       updatedAt: Date.now(),
     });
     setBridgeStatus(response?.error || "Browser action failed.");
-    renderBrowserSnapshot();
-    renderPendingBrowserAction();
     renderMessages();
     await sendBrowserActionFollowup(messageId, "error");
     return;
@@ -754,6 +713,9 @@ async function executeBrowserActionRequest(messageId) {
 
   if (response.result?.snapshot && entry.pageKey) {
     setBrowserSnapshotForPage(entry.pageKey, response.result.snapshot);
+  }
+  if (response.result?.actionRecord && entry.pageKey) {
+    appendBrowserActionHistory(entry.pageKey, response.result.actionRecord);
   }
 
   updateBrowserActionRequest(messageId, {
@@ -766,8 +728,6 @@ async function executeBrowserActionRequest(messageId) {
   setBridgeStatus(
     response.result?.summary || `${entry.request.action} completed on the active page.`,
   );
-  renderBrowserSnapshot();
-  renderPendingBrowserAction();
   renderMessages();
   await sendBrowserActionFollowup(messageId, "success");
 }
@@ -798,7 +758,6 @@ async function approvePendingBrowserAction(messageId = "") {
     updatedAt: Date.now(),
   });
   setBridgeStatus("Browser actions are allowed for this page.");
-  renderPendingBrowserAction();
   void executeBrowserActionRequest(pending.messageId);
 }
 
@@ -814,7 +773,6 @@ async function rejectPendingBrowserAction(messageId = "") {
     updatedAt: Date.now(),
   });
   setBridgeStatus("Browser action request rejected.");
-  renderPendingBrowserAction();
   renderMessages();
   await sendBrowserActionFollowup(pending.messageId, "denied");
 }
@@ -838,6 +796,42 @@ async function sendBrowserActionFollowup(messageId, outcome) {
       "Browser action finished, but the result could not be sent back to the gateway.",
     );
   }
+}
+
+async function sendInvalidBrowserActionRepair(messageId) {
+  const entry = state.browserActionRequests[messageId];
+  if (
+    !entry ||
+    entry.status !== "invalid" ||
+    entry.repairSentAt ||
+    entry.threadStorageKey !== getActiveThreadStorageKey()
+  ) {
+    return;
+  }
+
+  const followupContent = buildInvalidBrowserActionFollowup(entry);
+  const sent = await sendSessionUserMessage(
+    entry.pageKey,
+    followupContent,
+    followupContent,
+    { threadId: entry.threadId },
+  );
+
+  updateBrowserActionRequest(messageId, {
+    repairSentAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+
+  if (!sent) {
+    setBridgeStatus(
+      "The assistant returned an invalid browser action and the repair request could not be sent.",
+    );
+    return;
+  }
+
+  setBridgeStatus(
+    entry.validation?.message || "The assistant returned an invalid browser action.",
+  );
 }
 
 function updateBrowserActionRequest(messageId, patch) {
@@ -948,29 +942,66 @@ function renderMessages() {
   const pendingRequest = getPendingBrowserActionRequest();
 
   messages.forEach((message) => {
-    const browserAction = extractBrowserActionFromContent(message.content);
-    const requestState = browserAction
-      ? state.browserActionRequests[message.id] || null
-      : null;
+    const requestState = state.browserActionRequests[message.id] || null;
+    const inspectedAction = requestState
+      ? null
+      : inspectBrowserActionFromContent(message.content);
+    const browserAction =
+      requestState?.request ||
+      (inspectedAction?.status !== "none" ? inspectedAction.request : null);
+    const derivedRequestState =
+      requestState ||
+      (inspectedAction?.status === "invalid"
+        ? {
+            status: "invalid",
+            validation: inspectedAction.error,
+            error: inspectedAction.error?.message || "",
+          }
+        : null);
+    const isBrowserActionMessage = Boolean(
+      browserAction || inspectedAction?.status === "invalid",
+    );
+    const browserFollowup = inspectBrowserFollowupMessage(message.content);
+    const isBrowserMessage = isBrowserActionMessage || Boolean(browserFollowup);
+    const browserTone = resolveBrowserMessageTone(
+      derivedRequestState,
+      browserFollowup,
+    );
 
     const container = document.createElement("article");
     container.className = `message ${message.role}`;
-    if (browserAction) {
+    if (isBrowserActionMessage) {
       container.classList.add("action-request");
+    }
+    if (isBrowserMessage) {
+      container.classList.add("browser-message");
+    }
+    if (browserFollowup?.kind) {
+      container.classList.add(
+        "browser-followup",
+        `browser-followup-${browserFollowup.kind}`,
+      );
+    }
+    if (browserTone) {
+      container.classList.add(`browser-tone-${browserTone}`);
     }
 
     container.appendChild(createMessageCopyButton(message));
 
     const body = document.createElement("div");
     body.className = "message-body";
-    body.textContent = browserAction
-      ? summarizeBrowserActionForChat(browserAction, requestState)
-      : message.content;
+    if (browserFollowup) {
+      body.appendChild(createBrowserFollowupDisclosure(message.content, browserFollowup));
+    } else {
+      body.textContent = isBrowserActionMessage
+        ? summarizeBrowserActionForChat(browserAction, derivedRequestState)
+        : message.content;
+    }
     container.appendChild(body);
 
     const meta = document.createElement("div");
     meta.className = "message-meta";
-    meta.textContent = buildMessageMeta(message.timestamp, requestState);
+    meta.textContent = buildMessageMeta(message.timestamp, derivedRequestState);
     container.appendChild(meta);
 
     if (
@@ -1176,105 +1207,6 @@ function renderTabContext(context) {
   });
 }
 
-function renderBrowserSnapshot() {
-  const pageKey = state.activePageKey;
-  const snapshot = pageKey ? state.browserSnapshots[pageKey] || null : null;
-  const status = pageKey ? state.browserSnapshotStatus[pageKey] || null : null;
-
-  elements.browserSnapshot.innerHTML = "";
-  elements.snapshotStatus.textContent =
-    status?.message ||
-    "Refresh to inspect clickable and editable elements on the active page.";
-
-  if (!pageKey) {
-    const empty = document.createElement("p");
-    empty.className = "muted";
-    empty.textContent = "No page is selected yet.";
-    elements.browserSnapshot.appendChild(empty);
-    return;
-  }
-
-  if (status?.kind === "loading" && !snapshot) {
-    const loading = document.createElement("p");
-    loading.className = "muted";
-    loading.textContent = "Scanning the active page...";
-    elements.browserSnapshot.appendChild(loading);
-    return;
-  }
-
-  if (!snapshot) {
-    const empty = document.createElement("p");
-    empty.className = "muted";
-    empty.textContent = "No browser snapshot loaded yet.";
-    elements.browserSnapshot.appendChild(empty);
-    return;
-  }
-
-  const summary = document.createElement("p");
-  summary.className = "snapshot-summary";
-  summary.textContent = [
-    snapshot.pageTitle || "Untitled page",
-    snapshot.canonicalUrl || "",
-    `${snapshot.elements?.length || 0} interactive elements`,
-  ]
-    .filter(Boolean)
-    .join(" • ");
-  elements.browserSnapshot.appendChild(summary);
-
-  const excerpt = document.createElement("p");
-  excerpt.className = "snapshot-summary";
-  excerpt.textContent = snapshot.textExcerpt
-    ? `Visible text: ${snapshot.textExcerpt}`
-    : "No visible text excerpt was captured.";
-  elements.browserSnapshot.appendChild(excerpt);
-
-  const visibleElements = Array.isArray(snapshot.elements) ? snapshot.elements : [];
-  visibleElements
-    .slice(0, MAX_RENDERED_SNAPSHOT_ELEMENTS)
-    .forEach((element) => {
-      const item = document.createElement("div");
-      item.className = "snapshot-item";
-
-      const header = document.createElement("div");
-      header.className = "snapshot-item-header";
-
-      const title = document.createElement("div");
-      title.className = "snapshot-item-title";
-      title.textContent = formatSnapshotElementTitle(element);
-      header.appendChild(title);
-
-      const id = document.createElement("div");
-      id.className = "snapshot-item-id";
-      id.textContent = element.id || "untracked";
-      header.appendChild(id);
-
-      item.appendChild(header);
-
-      const meta = document.createElement("p");
-      meta.className = "snapshot-item-meta";
-      meta.textContent = [
-        formatSnapshotElementState(element),
-        element.selector ? `selector: ${element.selector}` : "",
-      ]
-        .filter(Boolean)
-        .join(" • ");
-      item.appendChild(meta);
-
-      elements.browserSnapshot.appendChild(item);
-    });
-
-  if (visibleElements.length > MAX_RENDERED_SNAPSHOT_ELEMENTS) {
-    const overflow = document.createElement("p");
-    overflow.className = "muted";
-    overflow.textContent = `Showing the first ${MAX_RENDERED_SNAPSHOT_ELEMENTS} elements.`;
-    elements.browserSnapshot.appendChild(overflow);
-  }
-}
-
-function renderPendingBrowserAction() {
-  elements.pendingBrowserAction.classList.add("hidden");
-}
-
 function renderThreadControls() {
   const scope = getPageSessionScope(state.activePageKey);
   const threads = state.activePageKey ? getPageSessionThreads(state.activePageKey) : [];
@@ -1327,6 +1259,7 @@ function exportActiveThread() {
       request: entry.request,
       status: entry.status,
       error: entry.error || "",
+      validation: entry.validation || null,
       approval: entry.approval || null,
       result: entry.result || null,
       createdAt: entry.createdAt,
@@ -1350,6 +1283,7 @@ function exportActiveThread() {
     },
     currentTabContext: state.currentTabContext || null,
     browserSnapshot: getActiveBrowserSnapshot(),
+    browserActionHistory: getBrowserActionHistoryForPage(pageKey),
     history: {
       syncStatus: threadStorageKey
         ? state.historySyncStatus[threadStorageKey] || "idle"
@@ -1440,32 +1374,38 @@ function setBridgeStatus(message) {
   elements.bridgeStatus.textContent = message;
 }
 
-function setBrowserSnapshotStatus(pageKey, kind, message) {
-  state.browserSnapshotStatus = {
-    ...state.browserSnapshotStatus,
-    [pageKey]: {
-      kind,
-      message,
-      updatedAt: Date.now(),
-    },
-  };
-}
-
 function setBrowserSnapshotForPage(pageKey, snapshot) {
   state.browserSnapshots = {
     ...state.browserSnapshots,
     [pageKey]: snapshot,
   };
-  setBrowserSnapshotStatus(
-    pageKey,
-    "ready",
-    snapshot
-      ? `Loaded ${snapshot.elements?.length || 0} interactive elements.`
-      : "The active page returned an empty browser snapshot.",
-  );
 }
 
-function buildPrompt(userMessage, context, snapshot, includeContext) {
+function appendBrowserActionHistory(pageKey, actionRecord) {
+  if (!pageKey || !actionRecord) {
+    return;
+  }
+
+  const existing = Array.isArray(state.browserActionHistory[pageKey])
+    ? state.browserActionHistory[pageKey]
+    : [];
+  state.browserActionHistory = {
+    ...state.browserActionHistory,
+    [pageKey]: [...existing, actionRecord].slice(-MAX_BROWSER_ACTION_HISTORY),
+  };
+}
+
+function getBrowserActionHistoryForPage(pageKey = state.activePageKey) {
+  if (!pageKey) {
+    return [];
+  }
+
+  return Array.isArray(state.browserActionHistory[pageKey])
+    ? state.browserActionHistory[pageKey]
+    : [];
+}
+
+function buildPrompt(userMessage, context, snapshot, actionHistory, includeContext) {
   if (!includeContext || !context) {
     return userMessage;
   }
@@ -1488,7 +1428,7 @@ function buildPrompt(userMessage, context, snapshot, includeContext) {
     sections.push(`Selected text:\n${context.selectionText}`);
   }
 
-  const snapshotText = formatBrowserSnapshotForPrompt(snapshot);
+  const browserStateText = formatBrowserStateForPrompt(snapshot, actionHistory);
 
   return [
     userMessage,
@@ -1498,29 +1438,37 @@ function buildPrompt(userMessage, context, snapshot, includeContext) {
     ...sections,
     "",
     "[Browser automation]",
-    "You have access to exactly five local browser actions on the active HTTP(S) tab only.",
+    "You have access to exactly seven local browser actions on the active HTTP(S) tab only.",
     "Respond with normal prose unless you need the browser to inspect or act on the page.",
     "If you need a browser action, reply with exactly one fenced browser-action JSON block and no extra prose.",
     'The block must contain valid JSON with an "action" field. Never include more than one browser-action block in a single response.',
     "Supported actions and expected JSON shapes:",
-    'browser.snapshot -> {"action":"browser.snapshot"}',
-    'browser.extract -> {"action":"browser.extract"} or {"action":"browser.extract","target":{"elementId":"el-2","selector":"main article"}}',
-    'browser.find -> {"action":"browser.find","query":"线索","kinds":["button","link"],"limit":8}',
-    'browser.click -> {"action":"browser.click","target":{"elementId":"el-2","selector":"button[data-testid=\\"continue\\"]"}}',
-    'browser.type -> {"action":"browser.type","target":{"elementId":"el-3","selector":"input[name=\\"email\\"]"},"text":"user@example.com","clear":true,"submit":false}',
-    "For browser.find, query is required. kinds is optional and filters by element kind. limit is optional. browser.find results include elementId plus context such as region, ancestors, and active state when available.",
-    "For browser.click and browser.type, target is required.",
+    'browser.extract -> {"action":"browser.extract"} or {"action":"browser.extract","target":{"observationId":"obs-42","elementId":"el-2"}}',
+    'browser.find -> {"action":"browser.find","query":"上传","kinds":["button","link"],"regions":["main_content"],"excludeRegions":["left_nav"],"limit":8}',
+    'browser.click -> {"action":"browser.click","target":{"observationId":"obs-42","elementId":"el-2"}}',
+    'browser.type -> {"action":"browser.type","target":{"observationId":"obs-42","elementId":"el-3"},"text":"user@example.com","clear":true,"submit":false}',
+    'browser.press -> {"action":"browser.press","target":{"observationId":"obs-42","elementId":"el-3"},"key":"Enter"}',
+    'browser.wait -> {"action":"browser.wait","until":{"urlIncludes":"/clues/list"},"timeoutMs":4000}',
+    'browser.scroll -> {"action":"browser.scroll","direction":"down","amount":"page"}',
+    "For browser.find, query is required. kinds, regions, excludeRegions, and limit are optional. browser.find results include observationId, elementId, context, and related elements.",
+    "For browser.extract, target is optional. For browser.click and browser.type, target is required and must come from a recent browser.find result with both observationId and elementId.",
+    "For browser.press, target is optional. Use it to send keys such as Enter, Escape, Tab, or ArrowDown to a specific element.",
+    "For browser.wait, use until with urlIncludes, titleIncludes, textIncludes, or query plus optional kinds/regions/excludeRegions. wait is for synchronization, not sleeping blindly.",
+    "For browser.scroll, use direction up/down/left/right and amount page, viewport, or a pixel number.",
     "For browser.type, text is required. clear defaults to true; set clear:false to append instead of replace. submit is optional and presses Enter after typing.",
-    'Prefer target.elementId from the latest Browser snapshot and include target.selector as a fallback when available. target.selector must be either a valid CSS selector for document.querySelector or a visible-text selector like "text=线索".',
-    "If the current Browser snapshot is missing or outdated, request browser.snapshot first. If the page is complex or the target is not visible in the snapshot, use browser.find before browser.click.",
-    "browser.click and browser.type may require one-time user approval for the current page.",
+    "Never invent elementId values. Never use CSS selectors, text selectors, or fuzzy targets for browser.click or browser.type.",
+    "There is no screenshot action. If you need to inspect the page, use browser.find or browser.extract.",
+    "If you do not already have an observationId + elementId pair for the exact target, call browser.find first.",
+    "Use browser.find whenever the user is unsure of the exact label, the page is complex, or the target is not explicitly identified in prior results.",
+    "browser.click, browser.type, and browser.press may require one-time user approval for the current page.",
     "Sensitive inputs such as password, payment, OTP, and token fields are blocked for browser.type.",
+    "If none of the seven browser actions fit, reply in normal prose instead of inventing a new browser action.",
     "Never wrap browser actions inside exec, shell, run, cat, or any other tool call. Reply with the browser-action JSON block directly.",
     "When the user asks for a multi-step browser task, continue one browser action at a time after each Browser action result until the user's stop condition is reached.",
-    "After every browser action, wait for the next Browser action result message and updated Browser snapshot before deciding the next step.",
+    "After every browser action, wait for the next Browser action result message before deciding the next step.",
     "",
-    "[Browser snapshot]",
-    snapshotText || "No browser snapshot is available yet. Request browser.snapshot before acting on the page.",
+    "[Browser state]",
+    browserStateText || "No browser state is cached yet. Use browser.find to inspect actionable elements or browser.extract to read page content before acting.",
   ].join("\n");
 }
 
@@ -1530,44 +1478,51 @@ function buildBrowserActionFollowup(entry, outcome) {
   lines.push(`Action: ${entry.request.action}`);
   const target = formatBrowserActionTarget(entry);
   const query = formatBrowserActionQuery(entry);
+  const actionDetail = formatBrowserActionDetail(entry);
   if (target) {
     lines.push(`Target: ${target}`);
   }
   if (query) {
     lines.push(`Query: ${query}`);
   }
+  if (actionDetail) {
+    lines.push(`Details: ${actionDetail}`);
+  }
 
   if (outcome === "success") {
     if (entry.result?.summary) {
-      lines.push(`Details: ${entry.result.summary}`);
+      lines.push(`Result: ${entry.result.summary}`);
     }
   } else if (outcome === "denied") {
-    lines.push("Details: The user rejected this page action request.");
+    lines.push("Result: The user rejected this page action request.");
   } else if (entry.error) {
-    lines.push(`Details: ${entry.error}`);
+    lines.push(`Result: ${entry.error}`);
   }
 
-  const snapshot = entry.result?.snapshot || getActiveBrowserSnapshot();
+  const page = entry.result?.page || summarizeObservationForPrompt(getActiveBrowserSnapshot());
+  const actionRecord = entry.result?.actionRecord || null;
   const findResults = formatBrowserFindResultsForPrompt(entry.result?.matches);
   if (findResults) {
     lines.push("");
     lines.push("[Browser find results]");
     lines.push(findResults);
   }
-  if (snapshot) {
+  if (actionRecord) {
     lines.push("");
-    lines.push("[Browser snapshot]");
-    lines.push(formatBrowserSnapshotForPrompt(snapshot));
+    lines.push("[Browser action record]");
+    lines.push(formatBrowserActionRecordForPrompt(actionRecord));
+  }
+  if (page) {
+    lines.push("");
+    lines.push("[Browser state]");
+    lines.push(formatBrowserStateSummaryForPrompt(page));
   }
 
   lines.push("");
   if (outcome === "success") {
-    lines.push(
-      "A fresh Browser snapshot is already included above. Do not request browser.snapshot again unless the page changed or this snapshot is insufficient.",
-    );
     if (entry.request.action === "browser.find") {
       lines.push(
-        "If you want to act on one of the found elements, prefer its elementId in the next browser.click or browser.type request.",
+        "If you want to act on one of the found elements, use its observationId and elementId in the next browser.click or browser.type request.",
       );
     }
     lines.push(
@@ -1578,12 +1533,48 @@ function buildBrowserActionFollowup(entry, outcome) {
       "The last browser action failed. Fix the request before retrying and do not repeat the same invalid action payload.",
     );
     lines.push(
-      'If you need to target a snapshot element, prefer {"target":{"elementId":"el-7"}} or include a selector like {"target":{"selector":"text=进入线索管理"}}.',
+      'If you need a new target, call browser.find first and then use {"target":{"observationId":"obs-42","elementId":"el-7"}}.',
     );
     lines.push(
       "Continue from this browser state. If another browser action is needed, respond with exactly one corrected browser-action JSON block and no extra prose.",
     );
   }
+  return lines.join("\n");
+}
+
+function buildInvalidBrowserActionFollowup(entry) {
+  const validation = entry.validation || {};
+  const lines = ["[Browser action validation error]"];
+  lines.push("Status: invalid_request");
+
+  if (entry.request?.action) {
+    lines.push(`Action: ${entry.request.action}`);
+  }
+  if (validation.message) {
+    lines.push(`Details: ${validation.message}`);
+  }
+  if (validation.hint) {
+    lines.push(`Hint: ${validation.hint}`);
+  }
+  if (
+    Array.isArray(validation.allowedActions) &&
+    validation.allowedActions.length > 0
+  ) {
+    lines.push(`Allowed actions: ${validation.allowedActions.join(", ")}`);
+  }
+
+  const page = summarizeObservationForPrompt(getActiveBrowserSnapshot());
+  if (page) {
+    lines.push("");
+    lines.push("[Browser state]");
+    lines.push(formatBrowserStateSummaryForPrompt(page));
+  }
+
+  lines.push("");
+  lines.push(
+    "Return exactly one corrected browser-action JSON block using only the allowed actions above, or reply in normal prose if no browser action is needed.",
+  );
+  lines.push("Do not invent new browser actions.");
   return lines.join("\n");
 }
 
@@ -1618,160 +1609,6 @@ function getActiveBrowserSnapshot() {
     return null;
   }
   return state.browserSnapshots[state.activePageKey] || null;
-}
-
-function extractBrowserActionFromContent(content) {
-  if (typeof content !== "string") {
-    return null;
-  }
-
-  const candidates = [];
-  const browserActionMatch = content.match(BROWSER_ACTION_BLOCK_REGEX);
-  if (browserActionMatch?.[1]) {
-    candidates.push(browserActionMatch[1]);
-  }
-
-  for (const match of content.matchAll(JSON_CODE_BLOCK_REGEX)) {
-    if (match?.[1]) {
-      candidates.push(match[1]);
-    }
-  }
-
-  const trimmed = content.trim();
-  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-    candidates.push(trimmed);
-  }
-
-  if (candidates.length === 0) {
-    return null;
-  }
-
-  for (const candidate of candidates) {
-    try {
-      const parsed = JSON.parse(candidate);
-      const normalized = normalizeBrowserActionRequest(parsed);
-      if (normalized) {
-        return normalized;
-      }
-    } catch (error) {
-      continue;
-    }
-  }
-
-  return null;
-}
-
-function normalizeBrowserActionRequest(value) {
-  if (!value || typeof value !== "object") {
-    return null;
-  }
-
-  const action =
-    typeof value.action === "string"
-      ? value.action.trim()
-      : typeof value.type === "string"
-        ? value.type.trim()
-        : "";
-  if (!SUPPORTED_BROWSER_ACTIONS.has(action)) {
-    return null;
-  }
-
-  const normalized = { action };
-  const target = normalizeBrowserActionTargetInput(
-    Object.prototype.hasOwnProperty.call(value, "target") ? value.target : value,
-  );
-  if (target) {
-    normalized.target = target;
-  }
-
-  if (typeof value.text === "string") {
-    normalized.text = value.text;
-  }
-  if (typeof value.query === "string") {
-    normalized.query = value.query;
-  }
-  const kinds = normalizeBrowserActionKindsInput(value.kinds);
-  if (kinds.length > 0) {
-    normalized.kinds = kinds;
-  }
-  const limit = normalizeBrowserActionLimitInput(value.limit);
-  if (limit !== null) {
-    normalized.limit = limit;
-  }
-  if (value.clear === false) {
-    normalized.clear = false;
-  }
-  if (value.submit === true) {
-    normalized.submit = true;
-  }
-
-  return normalized;
-}
-
-function normalizeBrowserActionKindsInput(value) {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return Array.from(
-    new Set(
-      value
-        .map((entry) =>
-          typeof entry === "string" ? entry.trim().toLowerCase() : "",
-        )
-        .filter(Boolean),
-    ),
-  ).slice(0, 8);
-}
-
-function normalizeBrowserActionLimitInput(value) {
-  if (value === null || value === undefined || value === "") {
-    return null;
-  }
-
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) {
-    return null;
-  }
-
-  return Math.max(1, Math.min(20, Math.round(numeric)));
-}
-
-function normalizeBrowserActionTargetInput(value) {
-  if (!value) {
-    return null;
-  }
-
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return null;
-    }
-
-    if (/^el-\d+$/i.test(trimmed)) {
-      return { elementId: trimmed };
-    }
-
-    return { selector: trimmed };
-  }
-
-  if (typeof value !== "object") {
-    return null;
-  }
-
-  const elementId =
-    typeof value.elementId === "string" ? value.elementId.trim() : "";
-  const selector =
-    typeof value.selector === "string" ? value.selector.trim() : "";
-
-  if (!elementId && !selector) {
-    return null;
-  }
-
-  return {
-    elementId: elementId || undefined,
-    selector: selector || undefined,
-  };
 }
 
 async function loadRemoteHistoryForPage(pageKey, options = {}) {
@@ -2050,7 +1887,6 @@ async function setActiveThreadForPage(pageKey, threadId) {
     renderSession();
     renderMessages();
     renderTyping();
-    renderPendingBrowserAction();
     updateConnectionStateForActivePage();
     void loadRemoteHistoryForPage(pageKey, { threadId });
     if (state.shouldMaintainConnections) {
@@ -2266,40 +2102,6 @@ function mergeHistoryMessages(historyMessages, currentMessages) {
   );
 }
 
-function formatBrowserSnapshotForPrompt(snapshot) {
-  if (!snapshot) {
-    return "";
-  }
-
-  const lines = [];
-  if (snapshot.pageTitle) {
-    lines.push(`Page title: ${snapshot.pageTitle}`);
-  }
-  if (snapshot.canonicalUrl) {
-    lines.push(`URL: ${snapshot.canonicalUrl}`);
-  }
-  if (snapshot.textExcerpt) {
-    lines.push(`Visible text: ${snapshot.textExcerpt}`);
-  }
-
-  const elementsList = Array.isArray(snapshot.elements) ? snapshot.elements : [];
-  if (elementsList.length > 0) {
-    lines.push("Interactive elements:");
-    elementsList.slice(0, MAX_PROMPT_SNAPSHOT_ELEMENTS).forEach((element) => {
-      lines.push(`- ${formatSnapshotElementForPrompt(element)}`);
-    });
-    if (elementsList.length > MAX_PROMPT_SNAPSHOT_ELEMENTS) {
-      lines.push(
-        `- ...and ${elementsList.length - MAX_PROMPT_SNAPSHOT_ELEMENTS} more`,
-      );
-    }
-  } else {
-    lines.push("Interactive elements: none captured");
-  }
-
-  return lines.join("\n");
-}
-
 function formatSnapshotElementForPrompt(element) {
   const title = formatSnapshotElementTitle(element);
   const stateText = formatSnapshotElementState(element);
@@ -2312,7 +2114,6 @@ function formatSnapshotElementTitle(element) {
     element.text ||
     element.placeholder ||
     element.href ||
-    element.selector ||
     "Unnamed element";
   return `${element.kind || element.tagName || "element"} "${truncateText(
     title,
@@ -2355,6 +2156,13 @@ function formatSnapshotElementState(element) {
 }
 
 function summarizeBrowserActionForChat(request, requestState) {
+  if (requestState?.validation) {
+    const suffix = requestState ? ` (${describeBrowserActionStatus(requestState)})` : "";
+    return `Browser action request: ${summarizeInvalidBrowserAction(
+      requestState.validation,
+    )}${suffix}`;
+  }
+
   const prefix = summarizeBrowserActionRequest(request);
   const suffix = requestState ? ` (${describeBrowserActionStatus(requestState)})` : "";
   return `Browser action request: ${prefix}${suffix}`;
@@ -2363,8 +2171,6 @@ function summarizeBrowserActionForChat(request, requestState) {
 function summarizeBrowserActionRequest(request) {
   const target = formatBrowserActionTarget({ request });
   switch (request.action) {
-    case "browser.snapshot":
-      return "capture a fresh browser snapshot";
     case "browser.extract":
       return target ? `extract content from ${target}` : "extract page content";
     case "browser.find":
@@ -2377,6 +2183,14 @@ function summarizeBrowserActionRequest(request) {
       return target
         ? `type into ${target}`
         : "type into the requested input";
+    case "browser.press":
+      return target
+        ? `press ${request.key || "a key"} on ${target}`
+        : `press ${request.key || "a key"}`;
+    case "browser.wait":
+      return "wait for the requested page condition";
+    case "browser.scroll":
+      return `scroll ${request.direction || "down"}`;
     default:
       return request.action;
   }
@@ -2394,6 +2208,9 @@ function formatBrowserActionTarget(entryOrTarget) {
   }
 
   const parts = [];
+  if (targetDescriptor.observationId) {
+    parts.push(targetDescriptor.observationId);
+  }
   if (targetDescriptor.elementId || targetDescriptor.id) {
     parts.push(targetDescriptor.elementId || targetDescriptor.id);
   }
@@ -2401,8 +2218,7 @@ function formatBrowserActionTarget(entryOrTarget) {
   const label =
     targetDescriptor.label ||
     targetDescriptor.text ||
-    targetDescriptor.placeholder ||
-    targetDescriptor.selector;
+    targetDescriptor.placeholder;
   if (label) {
     parts.push(`"${truncateText(label, 80)}"`);
   }
@@ -2410,9 +2226,97 @@ function formatBrowserActionTarget(entryOrTarget) {
   return parts.join(" ");
 }
 
+function summarizeInvalidBrowserAction(validation) {
+  if (!validation || typeof validation !== "object") {
+    return "invalid browser action";
+  }
+
+  switch (validation.code) {
+    case "unsupported_action":
+      return validation.unsupportedAction
+        ? `unsupported action "${validation.unsupportedAction}"`
+        : "unsupported browser action";
+    case "invalid_json":
+      return "invalid browser-action JSON";
+    case "missing_action":
+      return 'missing "action" field';
+    default:
+      return validation.message || "invalid browser action";
+  }
+}
+
 function formatBrowserActionQuery(entryOrRequest) {
-  const query = entryOrRequest?.request?.query || entryOrRequest?.query || "";
+  const query =
+    entryOrRequest?.request?.query ||
+    entryOrRequest?.query ||
+    entryOrRequest?.request?.until?.query ||
+    entryOrRequest?.until?.query ||
+    "";
   return typeof query === "string" ? query.trim() : "";
+}
+
+function formatBrowserActionDetail(entryOrRequest) {
+  const request = entryOrRequest?.request || entryOrRequest || null;
+  const validation = entryOrRequest?.validation || null;
+  if (validation) {
+    return [
+      validation.message || "",
+      validation.hint || "",
+      Array.isArray(validation.allowedActions) && validation.allowedActions.length > 0
+        ? `allowed: ${validation.allowedActions.join(", ")}`
+        : "",
+    ]
+      .filter(Boolean)
+      .join(" • ");
+  }
+
+  if (!request || typeof request !== "object") {
+    return "";
+  }
+
+  switch (request.action) {
+    case "browser.press":
+      return request.key ? `key: ${request.key}` : "";
+    case "browser.wait":
+      return formatBrowserWaitCondition(request.until);
+    case "browser.scroll":
+      return [request.direction || "down", request.amount || "page"]
+        .filter(Boolean)
+        .join(" ");
+    case "browser.find":
+      return [
+        Array.isArray(request.kinds) && request.kinds.length > 0
+          ? `kinds: ${request.kinds.join(", ")}`
+          : "",
+        Array.isArray(request.regions) && request.regions.length > 0
+          ? `regions: ${request.regions.join(", ")}`
+          : "",
+        Array.isArray(request.excludeRegions) && request.excludeRegions.length > 0
+          ? `exclude: ${request.excludeRegions.join(", ")}`
+          : "",
+      ]
+        .filter(Boolean)
+        .join(" • ");
+    default:
+      return "";
+  }
+}
+
+function formatBrowserWaitCondition(until) {
+  if (!until || typeof until !== "object") {
+    return "";
+  }
+
+  return [
+    until.urlIncludes ? `url includes "${truncateText(until.urlIncludes, 60)}"` : "",
+    until.titleIncludes
+      ? `title includes "${truncateText(until.titleIncludes, 60)}"`
+      : "",
+    until.textIncludes ? `text includes "${truncateText(until.textIncludes, 60)}"` : "",
+    until.query ? `${until.state === "disappear" ? "disappear" : "appear"} "${truncateText(until.query, 60)}"` : "",
+  ]
+    .filter(Boolean)
+    .join(" • ");
 }
 
 function formatBrowserFindResultsForPrompt(matches) {
@@ -2423,6 +2327,9 @@ function formatBrowserFindResultsForPrompt(matches) {
   return matches
     .map((match) => {
       const parts = [`- ${formatSnapshotElementForPrompt(match)}`];
+      if (match.observationId) {
+        parts.push(`observation: ${match.observationId}`);
+      }
       if (match.region) {
         parts.push(`region: ${match.region}`);
       }
@@ -2434,12 +2341,133 @@ function formatBrowserFindResultsForPrompt(matches) {
       if (typeof match.score === "number") {
         parts.push(`score ${match.score.toFixed(2)}`);
       }
-      if (match.selector) {
-        parts.push(`selector: ${truncateText(match.selector, 120)}`);
+      if (Array.isArray(match.related) && match.related.length > 0) {
+        parts.push(
+          `related: ${match.related
+            .map((item) =>
+              truncateText(
+                [item.kind || "element", item.text ? `"${item.text}"` : ""]
+                  .filter(Boolean)
+                  .join(" "),
+                60,
+              ),
+            )
+            .join(" | ")}`,
+        );
       }
       return parts.join(" • ");
     })
     .join("\n");
+}
+
+function summarizeObservationForPrompt(snapshot) {
+  if (!snapshot) {
+    return null;
+  }
+
+  return {
+    observationId: snapshot.observationId || "",
+    pageTitle: snapshot.pageTitle || "",
+    canonicalUrl: snapshot.canonicalUrl || "",
+    observedAt: snapshot.observedAt || Date.now(),
+    textExcerpt: truncateText(snapshot.textExcerpt || "", 200),
+    elementCount:
+      Number.isFinite(snapshot.elementCount) && snapshot.elementCount >= 0
+        ? snapshot.elementCount
+        : Array.isArray(snapshot.elements)
+          ? snapshot.elements.length
+          : 0,
+  };
+}
+
+function formatBrowserStateSummaryForPrompt(page) {
+  if (!page) {
+    return "";
+  }
+
+  const lines = [];
+  if (page.pageTitle) {
+    lines.push(`Page title: ${page.pageTitle}`);
+  }
+  if (page.canonicalUrl) {
+    lines.push(`URL: ${page.canonicalUrl}`);
+  }
+  if (page.observationId) {
+    lines.push(`Observation: ${page.observationId}`);
+  }
+  if (Number.isFinite(page.elementCount)) {
+    lines.push(`Interactive elements: ${page.elementCount}`);
+  }
+  if (page.textExcerpt) {
+    lines.push(`Visible text summary: ${page.textExcerpt}`);
+  }
+  return lines.join("\n");
+}
+
+function formatBrowserActionRecordForPrompt(record) {
+  if (!record) {
+    return "";
+  }
+
+  const lines = [];
+  if (record.summary) {
+    lines.push(`Summary: ${record.summary}`);
+  }
+  if (record.before?.observationId || record.after?.observationId) {
+    lines.push(
+      `Observations: ${record.before?.observationId || "unknown"} -> ${record.after?.observationId || "unknown"}`,
+    );
+  }
+  if (record.diff) {
+    const diffSummary = [];
+    if (record.diff.urlChanged) {
+      diffSummary.push("URL changed");
+    }
+    if (record.diff.titleChanged) {
+      diffSummary.push("title changed");
+    }
+    if (record.diff.textChanged) {
+      diffSummary.push("text changed");
+    }
+    if (Array.isArray(record.diff.added) && record.diff.added.length > 0) {
+      diffSummary.push(`added: ${record.diff.added.join(" | ")}`);
+    }
+    if (Array.isArray(record.diff.removed) && record.diff.removed.length > 0) {
+      diffSummary.push(`removed: ${record.diff.removed.join(" | ")}`);
+    }
+    if (diffSummary.length > 0) {
+      lines.push(`Diff: ${diffSummary.join(" ; ")}`);
+    } else {
+      lines.push("Diff: no visible structural change detected");
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatBrowserStateForPrompt(snapshot, actionHistory) {
+  const lines = [];
+  const page = summarizeObservationForPrompt(snapshot);
+  if (page) {
+    lines.push(formatBrowserStateSummaryForPrompt(page));
+  }
+
+  const recentHistory = Array.isArray(actionHistory)
+    ? actionHistory.slice(-MAX_PROMPT_ACTION_HISTORY)
+    : [];
+  if (recentHistory.length > 0) {
+    lines.push("");
+    lines.push("Recent actions:");
+    recentHistory.forEach((record) => {
+      lines.push(
+        `- ${record.action?.action || "action"}: ${truncateText(
+          record.summary || "",
+          140,
+        )}`,
+      );
+    });
+  }
+
+  return lines.filter(Boolean).join("\n");
 }
 
 function describeBrowserActionStatus(entry) {
@@ -2448,6 +2476,8 @@ function describeBrowserActionStatus(entry) {
       return "queued";
     case "executing":
       return "running";
+    case "invalid":
+      return "invalid action";
     case "needs_approval":
       return "awaiting approval";
     case "completed":
@@ -2472,6 +2502,111 @@ function buildMessageMeta(timestamp, requestState) {
   }
 
   return parts.join(" • ");
+}
+
+function inspectBrowserFollowupMessage(content) {
+  const text = typeof content === "string" ? content.trimStart() : "";
+  if (!text) {
+    return null;
+  }
+
+  if (text.startsWith("[Browser action validation error]")) {
+    return {
+      kind: "validation",
+      tone: "warning",
+    };
+  }
+
+  if (!text.startsWith("[Browser action result]")) {
+    return null;
+  }
+
+  const statusMatch = text.match(/^Status:\s*([a-z_]+)/im);
+  const status = (statusMatch?.[1] || "").toLowerCase();
+  return {
+    kind: "result",
+    status,
+    tone:
+      status === "success"
+        ? "success"
+        : status === "denied" || status === "error"
+          ? "warning"
+          : "info",
+  };
+}
+
+function resolveBrowserMessageTone(requestState, browserFollowup) {
+  if (browserFollowup?.tone) {
+    return browserFollowup.tone;
+  }
+
+  switch (requestState?.status) {
+    case "completed":
+      return "success";
+    case "needs_approval":
+      return "pending";
+    case "invalid":
+    case "error":
+    case "dismissed":
+      return "warning";
+    case "parsed":
+    case "executing":
+      return "info";
+    default:
+      return "";
+  }
+}
+
+function createBrowserFollowupDisclosure(content, browserFollowup) {
+  const details = document.createElement("details");
+  details.className = "browser-followup-details";
+
+  const summary = document.createElement("summary");
+  summary.className = "browser-followup-summary";
+  summary.textContent = summarizeBrowserFollowupMessage(content, browserFollowup);
+  details.appendChild(summary);
+
+  const pre = document.createElement("pre");
+  pre.className = "browser-followup-content";
+  pre.textContent = content;
+  details.appendChild(pre);
+
+  return details;
+}
+
+function summarizeBrowserFollowupMessage(content, browserFollowup) {
+  const text = typeof content === "string" ? content : "";
+  const status = extractBrowserFollowupField(text, "Status");
+  const action = extractBrowserFollowupField(text, "Action");
+  const query = extractBrowserFollowupField(text, "Query");
+  const result = extractBrowserFollowupField(text, "Result");
+  const details = extractBrowserFollowupField(text, "Details");
+
+  if (browserFollowup?.kind === "validation") {
+    return [
+      "Browser validation",
+      details || result || action || "invalid request",
+      status || "",
+    ]
+      .filter(Boolean)
+      .join(" • ");
+  }
+
+  return [
+    "Browser result",
+    action || "action",
+    query ? `"${truncateText(query, 40)}"` : "",
+    truncateText(result || details || status || "view details", 80),
+  ]
+    .filter(Boolean)
+    .join(" • ");
+}
+
+function extractBrowserFollowupField(content, field) {
+  const text = typeof content === "string" ? content : "";
+  const pattern = new RegExp(`^${field}:\\s*(.+)$`, "im");
+  const match = text.match(pattern);
+  return match?.[1]?.trim() || "";
 }
 
 function truncateText(value, maxLength) {

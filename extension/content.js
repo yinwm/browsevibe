@@ -4,6 +4,15 @@ const MAX_SNAPSHOT_ELEMENTS = 30;
 const MAX_SNAPSHOT_TEXT_LENGTH = 400;
 const DEFAULT_FIND_RESULTS_LIMIT = 8;
 const MAX_FIND_RESULTS_LIMIT = 12;
+const DEFAULT_WAIT_TIMEOUT_MS = 4000;
+const MAX_WAIT_TIMEOUT_MS = 15000;
+const WAIT_POLL_INTERVAL_MS = 150;
+const MAX_ACTION_HISTORY = 10;
+const MAX_FIND_RELATED_ITEMS = 4;
+const MAX_DIFF_ITEMS = 4;
+const ACTION_SETTLE_INTERVAL_MS = 120;
+const ACTION_SETTLE_STABLE_ITERATIONS = 2;
+const ACTION_SETTLE_MAX_ITERATIONS = 8;
 const SNAPSHOT_CANDIDATE_SELECTOR = [
   'a[href]',
   "button",
@@ -23,7 +32,12 @@ const ALL_SNAPSHOT_CANDIDATE_SELECTOR = [
   HEURISTIC_SNAPSHOT_CANDIDATE_SELECTOR,
 ].join(", ");
 
+let browserProtocolPromise = null;
 let latestSnapshotElements = new Map();
+let latestObservation = null;
+let observationSequence = 0;
+let actionSequence = 0;
+let recentActionRecords = [];
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "sidebar:get-page-context") {
@@ -47,19 +61,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 async function handleBrowserBridgeAction(action) {
-  const normalizedAction = normalizeBrowserAction(action);
+  const { normalizeBrowserAction } = await getBrowserProtocol();
+  const normalizedAction = normalizeBrowserAction(action, {
+    allowStringTarget: false,
+    allowSelectorTarget: false,
+    allowInternalActions: true,
+    allowLegacyTopLevelTargetFields: false,
+    limitMax: MAX_FIND_RESULTS_LIMIT,
+    timeoutMaxMs: MAX_WAIT_TIMEOUT_MS,
+  });
   if (!normalizedAction) {
     return { ok: false, error: "Invalid browser action payload." };
   }
 
   switch (normalizedAction.action) {
     case "browser.snapshot":
-      return {
-        ok: true,
-        result: {
-          snapshot: collectBrowserSnapshot(),
-        },
-      };
+      return executeSnapshotAction();
     case "browser.extract":
       return executeExtractAction(normalizedAction);
     case "browser.find":
@@ -68,6 +85,12 @@ async function handleBrowserBridgeAction(action) {
       return executeClickAction(normalizedAction);
     case "browser.type":
       return executeTypeAction(normalizedAction);
+    case "browser.press":
+      return executePressAction(normalizedAction);
+    case "browser.wait":
+      return executeWaitAction(normalizedAction);
+    case "browser.scroll":
+      return executeScrollAction(normalizedAction);
     default:
       return {
         ok: false,
@@ -98,10 +121,31 @@ function collectPageContext() {
   };
 }
 
+function getBrowserProtocol() {
+  if (!browserProtocolPromise) {
+    browserProtocolPromise = import(chrome.runtime.getURL("browser-protocol.js"));
+  }
+
+  return browserProtocolPromise;
+}
+
+function executeSnapshotAction() {
+  const snapshot = collectBrowserSnapshot();
+  return {
+    ok: true,
+    result: {
+      snapshot,
+      page: summarizeObservation(snapshot),
+    },
+  };
+}
+
 function collectBrowserSnapshot() {
-  const registry = collectBrowserSnapshotRegistry(MAX_SNAPSHOT_ELEMENTS);
-  latestSnapshotElements = registry.elementMap;
-  return buildBrowserSnapshotFromDescriptors(registry.descriptors);
+  const registry = collectBrowserSnapshotRegistry();
+  return rememberObservation(
+    buildBrowserSnapshotFromDescriptors(registry.descriptors),
+    registry.elementMap,
+  );
 }
 
 function collectBrowserSnapshotRegistry(limit = Number.POSITIVE_INFINITY) {
@@ -127,81 +171,163 @@ function collectBrowserSnapshotRegistry(limit = Number.POSITIVE_INFINITY) {
 
 function buildBrowserSnapshotFromDescriptors(descriptors) {
   return {
+    observationId: nextObservationId(),
     pageTitle: document.title || "",
     canonicalUrl: location.href,
     observedAt: Date.now(),
     textExcerpt: getDocumentTextExcerpt(),
-    elements: descriptors.slice(0, MAX_SNAPSHOT_ELEMENTS),
+    elementCount: descriptors.length,
+    elements: descriptors,
   };
 }
 
+function nextObservationId() {
+  observationSequence += 1;
+  return `obs-${Date.now()}-${observationSequence}`;
+}
+
+function nextActionId() {
+  actionSequence += 1;
+  return `act-${Date.now()}-${actionSequence}`;
+}
+
+function rememberObservation(snapshot, elementMap) {
+  latestObservation = snapshot;
+  latestSnapshotElements = elementMap instanceof Map ? elementMap : new Map();
+  return snapshot;
+}
+
+function rememberActionRecord(record) {
+  recentActionRecords = [...recentActionRecords, record].slice(-MAX_ACTION_HISTORY);
+  return record;
+}
+
+function getCurrentObservation() {
+  return latestObservation;
+}
+
 function executeExtractAction(action) {
-  const snapshot = collectBrowserSnapshot();
-  const resolvedTarget = action.target
-    ? resolveActionTarget(action.target)
-    : null;
+  const beforeSnapshot = getCurrentObservation() || collectBrowserSnapshot();
+  const resolvedTarget = action.target ? resolveActionTarget(action.target) : null;
 
   if (action.target && !resolvedTarget?.ok) {
+    const actionRecord = rememberActionRecord(
+      createActionRecord(action, beforeSnapshot, beforeSnapshot, {
+        ok: false,
+        error: resolvedTarget.error,
+      }),
+    );
     return {
       ok: false,
       error: resolvedTarget.error,
       result: {
-        snapshot,
+        snapshot: beforeSnapshot,
+        page: summarizeObservation(beforeSnapshot),
+        actionRecord: summarizeActionRecord(actionRecord),
       },
     };
   }
 
   if (!resolvedTarget) {
+    const actionRecord = rememberActionRecord(
+      createActionRecord(action, beforeSnapshot, beforeSnapshot, {
+        ok: true,
+        summary: `Captured page context from ${beforeSnapshot.pageTitle || "the active page"}.`,
+      }),
+    );
     return {
       ok: true,
       result: {
         extracted: {
-          pageTitle: snapshot.pageTitle,
-          canonicalUrl: snapshot.canonicalUrl,
-          textExcerpt: snapshot.textExcerpt,
-          elementCount: snapshot.elements.length,
+          pageTitle: beforeSnapshot.pageTitle,
+          canonicalUrl: beforeSnapshot.canonicalUrl,
+          textExcerpt: beforeSnapshot.textExcerpt,
+          elementCount: beforeSnapshot.elementCount || beforeSnapshot.elements.length,
         },
-        snapshot,
+        summary: `Captured page context from ${beforeSnapshot.pageTitle || "the active page"}.`,
+        snapshot: beforeSnapshot,
+        page: summarizeObservation(beforeSnapshot),
+        actionRecord: summarizeActionRecord(actionRecord),
       },
     };
   }
 
+  const extracted = extractElementContent(resolvedTarget.element);
+  const actionRecord = rememberActionRecord(
+    createActionRecord(action, beforeSnapshot, beforeSnapshot, {
+      ok: true,
+      summary: `Extracted content from ${summarizeDescriptor(resolvedTarget.descriptor)}.`,
+    }),
+  );
   return {
     ok: true,
     result: {
-      extracted: extractElementContent(resolvedTarget.element),
+      extracted,
       target: resolvedTarget.descriptor,
-      snapshot,
+      summary: `Extracted content from ${summarizeDescriptor(resolvedTarget.descriptor)}.`,
+      snapshot: beforeSnapshot,
+      page: summarizeObservation(beforeSnapshot),
+      actionRecord: summarizeActionRecord(actionRecord),
     },
   };
 }
 
-function executeClickAction(action) {
+async function executeClickAction(action) {
+  const beforeSnapshot = getCurrentObservation() || collectBrowserSnapshot();
   const resolvedTarget = resolveActionTarget(action.target);
   if (!resolvedTarget.ok) {
+    const actionRecord = rememberActionRecord(
+      createActionRecord(action, beforeSnapshot, beforeSnapshot, {
+        ok: false,
+        error: resolvedTarget.error,
+      }),
+    );
     return {
       ok: false,
       error: resolvedTarget.error,
+      result: {
+        snapshot: beforeSnapshot,
+        page: summarizeObservation(beforeSnapshot),
+        actionRecord: summarizeActionRecord(actionRecord),
+      },
     };
   }
 
   const { element, descriptor } = resolvedTarget;
   if (!isElementVisible(element)) {
+    const actionRecord = rememberActionRecord(
+      createActionRecord(action, beforeSnapshot, beforeSnapshot, {
+        ok: false,
+        error: "Target element is not visible.",
+      }),
+    );
     return {
       ok: false,
       error: "Target element is not visible.",
       result: {
         target: descriptor,
+        snapshot: beforeSnapshot,
+        page: summarizeObservation(beforeSnapshot),
+        actionRecord: summarizeActionRecord(actionRecord),
       },
     };
   }
 
   if (isElementDisabled(element)) {
+    const actionRecord = rememberActionRecord(
+      createActionRecord(action, beforeSnapshot, beforeSnapshot, {
+        ok: false,
+        error: "Target element is disabled.",
+      }),
+    );
     return {
       ok: false,
       error: "Target element is disabled.",
       result: {
         target: descriptor,
+        snapshot: beforeSnapshot,
+        page: summarizeObservation(beforeSnapshot),
+        actionRecord: summarizeActionRecord(actionRecord),
       },
     };
   }
@@ -209,12 +335,29 @@ function executeClickAction(action) {
   scrollElementIntoView(element);
   focusElement(element);
   element.click();
+  await waitForPageSettle();
+  const afterSnapshot = collectBrowserSnapshot();
+  const diff = buildObservationDiff(beforeSnapshot, afterSnapshot);
+  const summary = `Clicked ${summarizeDescriptor(descriptor)}.`;
+  const actionRecord = rememberActionRecord(
+    createActionRecord(action, beforeSnapshot, afterSnapshot, {
+      ok: true,
+      summary,
+      diff,
+      target: descriptor,
+    }),
+  );
 
   return {
     ok: true,
     result: {
       target: descriptor,
-      summary: `Clicked ${summarizeDescriptor(descriptor)}.`,
+      summary,
+      snapshot: afterSnapshot,
+      page: summarizeObservation(afterSnapshot),
+      beforePage: summarizeObservation(beforeSnapshot),
+      diff,
+      actionRecord: summarizeActionRecord(actionRecord),
     },
   };
 }
@@ -222,17 +365,38 @@ function executeClickAction(action) {
 function executeFindAction(action) {
   const query = normalizeText(action.query || "");
   if (!query) {
+    const currentSnapshot = getCurrentObservation() || collectBrowserSnapshot();
+    const actionRecord = rememberActionRecord(
+      createActionRecord(action, currentSnapshot, currentSnapshot, {
+        ok: false,
+        error: "browser.find requires a query string.",
+      }),
+    );
     return {
       ok: false,
       error: "browser.find requires a query string.",
+      result: {
+        snapshot: currentSnapshot,
+        page: summarizeObservation(currentSnapshot),
+        actionRecord: summarizeActionRecord(actionRecord),
+      },
     };
   }
 
+  const beforeSnapshot = getCurrentObservation() || null;
   const registry = collectBrowserSnapshotRegistry();
-  latestSnapshotElements = registry.elementMap;
+  const snapshot = rememberObservation(
+    buildBrowserSnapshotFromDescriptors(registry.descriptors),
+    registry.elementMap,
+  );
 
-  const matches = registry.descriptors
+  const matches = snapshot.elements
     .filter((descriptor) => descriptorMatchesFindKinds(descriptor, action.kinds))
+    .filter((descriptor) => descriptorMatchesFindRegions(descriptor, action.regions))
+    .filter(
+      (descriptor) =>
+        !descriptorMatchesAnyRegion(descriptor, action.excludeRegions),
+    )
     .map((descriptor) => ({
       ...descriptor,
       score: scoreDescriptorForFind(descriptor, query),
@@ -243,47 +407,103 @@ function executeFindAction(action) {
     .map((descriptor) => ({
       ...descriptor,
       elementId: descriptor.id,
+      observationId: snapshot.observationId,
       score: Number(descriptor.score.toFixed(2)),
+      related: buildFindRelatedDescriptors(descriptor, snapshot.elements),
     }));
+
+  const effectiveBeforeSnapshot = beforeSnapshot || snapshot;
+  const diff = buildObservationDiff(effectiveBeforeSnapshot, snapshot);
+  const summary = buildFindSummary(query, matches, snapshot.observationId);
+  const actionRecord = rememberActionRecord(
+    createActionRecord(action, effectiveBeforeSnapshot, snapshot, {
+      ok: true,
+      summary,
+      diff,
+    }),
+  );
 
   return {
     ok: true,
     result: {
       matches,
-      summary: buildFindSummary(query, matches),
-      snapshot: buildBrowserSnapshotFromDescriptors(registry.descriptors),
+      observationId: snapshot.observationId,
+      summary,
+      snapshot,
+      page: summarizeObservation(snapshot),
+      beforePage: summarizeObservation(effectiveBeforeSnapshot),
+      diff,
+      actionRecord: summarizeActionRecord(actionRecord),
     },
   };
 }
 
-function executeTypeAction(action) {
+async function executeTypeAction(action) {
+  const beforeSnapshot = getCurrentObservation() || collectBrowserSnapshot();
   if (typeof action.text !== "string") {
+    const actionRecord = rememberActionRecord(
+      createActionRecord(action, beforeSnapshot, beforeSnapshot, {
+        ok: false,
+        error: "browser.type requires a text string.",
+      }),
+    );
     return {
       ok: false,
       error: "browser.type requires a text string.",
+      result: {
+        snapshot: beforeSnapshot,
+        page: summarizeObservation(beforeSnapshot),
+        actionRecord: summarizeActionRecord(actionRecord),
+      },
     };
   }
 
   const resolvedTarget = resolveActionTarget(action.target);
   if (!resolvedTarget.ok) {
+    const actionRecord = rememberActionRecord(
+      createActionRecord(action, beforeSnapshot, beforeSnapshot, {
+        ok: false,
+        error: resolvedTarget.error,
+      }),
+    );
     return {
       ok: false,
       error: resolvedTarget.error,
+      result: {
+        snapshot: beforeSnapshot,
+        page: summarizeObservation(beforeSnapshot),
+        actionRecord: summarizeActionRecord(actionRecord),
+      },
     };
   }
 
   const { element, descriptor } = resolvedTarget;
   if (!isEditableElement(element)) {
+    const actionRecord = rememberActionRecord(
+      createActionRecord(action, beforeSnapshot, beforeSnapshot, {
+        ok: false,
+        error: "Target element is not editable.",
+      }),
+    );
     return {
       ok: false,
       error: "Target element is not editable.",
       result: {
         target: descriptor,
+        snapshot: beforeSnapshot,
+        page: summarizeObservation(beforeSnapshot),
+        actionRecord: summarizeActionRecord(actionRecord),
       },
     };
   }
 
   if (isSensitiveElement(element)) {
+    const actionRecord = rememberActionRecord(
+      createActionRecord(action, beforeSnapshot, beforeSnapshot, {
+        ok: false,
+        error: "Sensitive inputs are blocked for browser.type.",
+      }),
+    );
     return {
       ok: false,
       error: "Sensitive inputs are blocked for browser.type.",
@@ -292,16 +512,28 @@ function executeTypeAction(action) {
           ...descriptor,
           sensitive: true,
         },
+        snapshot: beforeSnapshot,
+        page: summarizeObservation(beforeSnapshot),
+        actionRecord: summarizeActionRecord(actionRecord),
       },
     };
   }
 
   if (isElementDisabled(element)) {
+    const actionRecord = rememberActionRecord(
+      createActionRecord(action, beforeSnapshot, beforeSnapshot, {
+        ok: false,
+        error: "Target element is disabled.",
+      }),
+    );
     return {
       ok: false,
       error: "Target element is disabled.",
       result: {
         target: descriptor,
+        snapshot: beforeSnapshot,
+        page: summarizeObservation(beforeSnapshot),
+        actionRecord: summarizeActionRecord(actionRecord),
       },
     };
   }
@@ -314,99 +546,236 @@ function executeTypeAction(action) {
     dispatchKeyboardEnter(element);
   }
 
+  await waitForPageSettle();
+  const afterSnapshot = collectBrowserSnapshot();
+  const diff = buildObservationDiff(beforeSnapshot, afterSnapshot);
+  const summary = `Typed into ${summarizeDescriptor(descriptor)}.`;
+  const actionRecord = rememberActionRecord(
+    createActionRecord(action, beforeSnapshot, afterSnapshot, {
+      ok: true,
+      summary,
+      diff,
+      target: descriptor,
+    }),
+  );
+
   return {
     ok: true,
     result: {
       target: descriptor,
-      summary: `Typed into ${summarizeDescriptor(descriptor)}.`,
+      summary,
+      snapshot: afterSnapshot,
+      page: summarizeObservation(afterSnapshot),
+      beforePage: summarizeObservation(beforeSnapshot),
+      diff,
+      actionRecord: summarizeActionRecord(actionRecord),
     },
   };
 }
 
-function normalizeBrowserAction(action) {
-  if (!action || typeof action !== "object") {
-    return null;
+async function executePressAction(action) {
+  const beforeSnapshot = getCurrentObservation() || collectBrowserSnapshot();
+  if (typeof action.key !== "string" || !action.key.trim()) {
+    const actionRecord = rememberActionRecord(
+      createActionRecord(action, beforeSnapshot, beforeSnapshot, {
+        ok: false,
+        error: "browser.press requires a key string.",
+      }),
+    );
+    return {
+      ok: false,
+      error: "browser.press requires a key string.",
+      result: {
+        snapshot: beforeSnapshot,
+        page: summarizeObservation(beforeSnapshot),
+        actionRecord: summarizeActionRecord(actionRecord),
+      },
+    };
   }
 
-  const actionType =
-    typeof action.action === "string"
-      ? action.action.trim()
-      : typeof action.type === "string"
-        ? action.type.trim()
-        : "";
-
-  if (!actionType) {
-    return null;
+  const targetResult = resolvePressTarget(action.target);
+  if (!targetResult.ok) {
+    const actionRecord = rememberActionRecord(
+      createActionRecord(action, beforeSnapshot, beforeSnapshot, {
+        ok: false,
+        error: targetResult.error,
+      }),
+    );
+    return {
+      ok: false,
+      error: targetResult.error,
+      result: {
+        snapshot: beforeSnapshot,
+        page: summarizeObservation(beforeSnapshot),
+        actionRecord: summarizeActionRecord(actionRecord),
+      },
+    };
   }
 
-  const normalized = {
-    action: actionType,
-  };
-
-  const target = normalizeActionTarget(action);
-  if (target) {
-    normalized.target = target;
+  const { element, descriptor } = targetResult;
+  if (element instanceof HTMLElement) {
+    scrollElementIntoView(element);
+    focusElement(element);
   }
 
-  if (typeof action.text === "string") {
-    normalized.text = action.text;
-  }
-  if (typeof action.query === "string") {
-    normalized.query = action.query;
-  }
-  const kinds = normalizeFindKindsInput(action.kinds);
-  if (kinds.length > 0) {
-    normalized.kinds = kinds;
-  }
-  const limit = normalizeFindLimitInput(action.limit);
-  if (limit !== null) {
-    normalized.limit = limit;
-  }
-  if (action.clear === false) {
-    normalized.clear = false;
-  }
-  if (action.submit === true) {
-    normalized.submit = true;
-  }
-
-  return normalized;
-}
-
-function normalizeActionTarget(action) {
-  if (!action || typeof action !== "object") {
-    return null;
-  }
-
-  return normalizeActionTargetInput(
-    Object.prototype.hasOwnProperty.call(action, "target") ? action.target : action,
+  dispatchKeyboardKey(element, action.key);
+  await waitForPageSettle();
+  const afterSnapshot = collectBrowserSnapshot();
+  const diff = buildObservationDiff(beforeSnapshot, afterSnapshot);
+  const summary = `Pressed ${action.key} on ${summarizeDescriptor(descriptor)}.`;
+  const actionRecord = rememberActionRecord(
+    createActionRecord(action, beforeSnapshot, afterSnapshot, {
+      ok: true,
+      summary,
+      diff,
+      target: descriptor,
+    }),
   );
+
+  return {
+    ok: true,
+    result: {
+      target: descriptor,
+      summary,
+      snapshot: afterSnapshot,
+      page: summarizeObservation(afterSnapshot),
+      beforePage: summarizeObservation(beforeSnapshot),
+      diff,
+      actionRecord: summarizeActionRecord(actionRecord),
+    },
+  };
 }
 
-function normalizeFindKindsInput(value) {
-  if (!Array.isArray(value)) {
-    return [];
+async function executeWaitAction(action) {
+  const beforeSnapshot = getCurrentObservation() || collectBrowserSnapshot();
+  const startedAt = Date.now();
+  const timeoutMs =
+    Number.isFinite(action.timeoutMs) && action.timeoutMs > 0
+      ? action.timeoutMs
+      : DEFAULT_WAIT_TIMEOUT_MS;
+
+  let afterSnapshot = beforeSnapshot;
+  let matched = false;
+
+  if (!action.until) {
+    await waitForPageSettle();
+    afterSnapshot = collectBrowserSnapshot();
+    matched = true;
+  } else {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() <= deadline) {
+      afterSnapshot = collectBrowserSnapshot();
+      if (matchesWaitCondition(action.until, afterSnapshot)) {
+        matched = true;
+        break;
+      }
+
+      await delay(WAIT_POLL_INTERVAL_MS);
+    }
   }
 
-  return Array.from(
-    new Set(
-      value
-        .map((entry) => (typeof entry === "string" ? entry.trim().toLowerCase() : ""))
-        .filter(Boolean),
-    ),
-  ).slice(0, 8);
+  const diff = buildObservationDiff(beforeSnapshot, afterSnapshot);
+  if (!matched) {
+    const error = `browser.wait timed out after ${timeoutMs}ms.`;
+    const actionRecord = rememberActionRecord(
+      createActionRecord(action, beforeSnapshot, afterSnapshot, {
+        ok: false,
+        error,
+        diff,
+      }),
+    );
+    return {
+      ok: false,
+      error,
+      result: {
+        snapshot: afterSnapshot,
+        page: summarizeObservation(afterSnapshot),
+        beforePage: summarizeObservation(beforeSnapshot),
+        diff,
+        actionRecord: summarizeActionRecord(actionRecord),
+      },
+    };
+  }
+
+  const waitedMs = Math.max(0, Date.now() - startedAt);
+  const summary = action.until
+    ? `Wait condition satisfied after ${waitedMs}ms.`
+    : "Page settled.";
+  const actionRecord = rememberActionRecord(
+    createActionRecord(action, beforeSnapshot, afterSnapshot, {
+      ok: true,
+      summary,
+      diff,
+    }),
+  );
+  return {
+    ok: true,
+    result: {
+      summary,
+      snapshot: afterSnapshot,
+      page: summarizeObservation(afterSnapshot),
+      beforePage: summarizeObservation(beforeSnapshot),
+      diff,
+      actionRecord: summarizeActionRecord(actionRecord),
+    },
+  };
 }
 
-function normalizeFindLimitInput(value) {
-  if (value === null || value === undefined || value === "") {
-    return null;
+async function executeScrollAction(action) {
+  const beforeSnapshot = getCurrentObservation() || collectBrowserSnapshot();
+  let targetDescriptor = null;
+  if (action.target) {
+    const resolvedTarget = resolveActionTarget(action.target);
+    if (!resolvedTarget.ok) {
+      const actionRecord = rememberActionRecord(
+        createActionRecord(action, beforeSnapshot, beforeSnapshot, {
+          ok: false,
+          error: resolvedTarget.error,
+        }),
+      );
+      return {
+        ok: false,
+        error: resolvedTarget.error,
+        result: {
+          snapshot: beforeSnapshot,
+          page: summarizeObservation(beforeSnapshot),
+          actionRecord: summarizeActionRecord(actionRecord),
+        },
+      };
+    }
+
+    targetDescriptor = resolvedTarget.descriptor;
+    scrollElementIntoView(resolvedTarget.element);
+  } else {
+    scrollViewport(action.direction, action.amount);
   }
 
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) {
-    return null;
-  }
+  await waitForPageSettle();
+  const afterSnapshot = collectBrowserSnapshot();
+  const diff = buildObservationDiff(beforeSnapshot, afterSnapshot);
+  const summary = action.target
+    ? "Scrolled the target into view."
+    : `Scrolled ${action.direction || "down"} by ${formatScrollAmount(action.amount)}.`;
+  const actionRecord = rememberActionRecord(
+    createActionRecord(action, beforeSnapshot, afterSnapshot, {
+      ok: true,
+      summary,
+      diff,
+      target: targetDescriptor,
+    }),
+  );
 
-  return Math.max(1, Math.min(MAX_FIND_RESULTS_LIMIT, Math.round(numeric)));
+  return {
+    ok: true,
+    result: {
+      summary,
+      snapshot: afterSnapshot,
+      page: summarizeObservation(afterSnapshot),
+      beforePage: summarizeObservation(beforeSnapshot),
+      diff,
+      actionRecord: summarizeActionRecord(actionRecord),
+    },
+  };
 }
 
 function collectSnapshotCandidateElements(limit = Number.POSITIVE_INFINITY) {
@@ -440,43 +809,6 @@ function maybeAppendSnapshotCandidate(candidates, element, limit) {
   candidates.push(element);
 }
 
-function normalizeActionTargetInput(value) {
-  if (!value) {
-    return null;
-  }
-
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return null;
-    }
-
-    if (/^el-\d+$/i.test(trimmed)) {
-      return { elementId: trimmed };
-    }
-
-    return { selector: trimmed };
-  }
-
-  if (typeof value !== "object") {
-    return null;
-  }
-
-  const elementId =
-    typeof value.elementId === "string" ? value.elementId.trim() : "";
-  const selector =
-    typeof value.selector === "string" ? value.selector.trim() : "";
-
-  if (!elementId && !selector) {
-    return null;
-  }
-
-  return {
-    elementId: elementId || undefined,
-    selector: selector || undefined,
-  };
-}
-
 function resolveActionTarget(target) {
   if (!target) {
     return {
@@ -485,206 +817,88 @@ function resolveActionTarget(target) {
     };
   }
 
-  let element = null;
-  if (target.elementId && latestSnapshotElements.has(target.elementId)) {
-    const snapshotElement = latestSnapshotElements.get(target.elementId);
-    if (snapshotElement?.isConnected) {
-      element = snapshotElement;
-    }
+  if (!target.observationId || !target.elementId) {
+    return {
+      ok: false,
+      error:
+        "Browser action target must include both observationId and elementId from browser.find.",
+    };
   }
 
-  if (!element && target.selector) {
-    const selectorTarget = resolveTargetBySelector(target.selector);
-    if (selectorTarget.error) {
-      return {
-        ok: false,
-        error: selectorTarget.error,
-      };
-    }
-    element = selectorTarget.element;
+  if (!latestObservation || latestObservation.observationId !== target.observationId) {
+    return {
+      ok: false,
+      error:
+        "The requested observation is stale or missing. Run browser.find again before clicking or typing.",
+    };
   }
 
+  const element = latestSnapshotElements.get(target.elementId);
   if (!element) {
     return {
       ok: false,
-      error: "Could not resolve the requested page element.",
+      error: `Could not find ${target.elementId} in observation ${target.observationId}. Run browser.find again.`,
     };
   }
+
+  if (!element.isConnected) {
+    return {
+      ok: false,
+      error:
+        "The requested element is no longer attached to the page. Run browser.find again before retrying.",
+    };
+  }
+
+  const descriptor = describeSnapshotElement(element, target.elementId);
 
   return {
     ok: true,
     element,
-    descriptor: describeSnapshotElement(
-      element,
-      target.elementId ||
-        findSnapshotElementIdForNode(element) ||
-        "selector-target",
-    ),
+    descriptor: {
+      ...descriptor,
+      observationId: target.observationId,
+    },
   };
 }
 
-function resolveTargetBySelector(selector) {
-  const normalizedSelector = String(selector || "").trim();
-  if (!normalizedSelector) {
-    return {
-      element: null,
-      error: "",
-    };
+function resolvePressTarget(target) {
+  if (target) {
+    return resolveActionTarget(target);
   }
 
-  const textSelector = resolveTextSelector(normalizedSelector);
-  if (textSelector.matched) {
-    return {
-      element: textSelector.element,
-      error: textSelector.error || "",
-    };
-  }
-
-  const hasTextSelector = resolveHasTextSelector(normalizedSelector);
-  if (hasTextSelector.matched) {
-    return {
-      element: hasTextSelector.element,
-      error: hasTextSelector.error || "",
-    };
-  }
-
-  try {
-    return {
-      element: document.querySelector(normalizedSelector),
-      error: "",
-    };
-  } catch (error) {
-    return {
-      element: null,
-      error: `Invalid selector: ${normalizedSelector}`,
-    };
-  }
-}
-
-function resolveTextSelector(selector) {
-  const match = selector.match(/^text\s*=\s*(.+)$/i);
-  if (!match?.[1]) {
-    return {
-      matched: false,
-      element: null,
-    };
-  }
-
-  const query = normalizeText(stripMatchingQuotes(match[1]));
-  if (!query) {
-    return {
-      matched: true,
-      element: null,
-    };
-  }
-
-  const snapshotCandidates = Array.from(latestSnapshotElements.values()).filter(
-    (element) => element?.isConnected && isElementVisible(element),
-  );
   const element =
-    findBestTextSelectorMatch(snapshotCandidates, query) ||
-    findBestTextSelectorMatch(
-      collectSnapshotCandidateElements(),
-      query,
-    );
+    document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : document.body instanceof HTMLElement
+        ? document.body
+        : null;
+  if (!element) {
+    return {
+      ok: false,
+      error: "No active page element is available for browser.press.",
+    };
+  }
+
+  const descriptor =
+    describeSnapshotElement(
+      element,
+      findSnapshotElementIdForNode(element) || "active-element",
+    ) || {
+      id: "active-element",
+      kind: element.tagName?.toLowerCase?.() || "element",
+      text: normalizeText(getElementText(element)),
+      label: normalizeText(getElementLabel(element)),
+      region: inferElementRegion(element, element.getBoundingClientRect()),
+    };
 
   return {
-    matched: true,
+    ok: true,
     element,
-    error: "",
+    descriptor: {
+      ...descriptor,
+      observationId: latestObservation?.observationId || "",
+    },
   };
-}
-
-function resolveHasTextSelector(selector) {
-  const match = selector.match(/^(.*?)\s*:has-text\((.+)\)\s*$/i);
-  if (!match) {
-    return {
-      matched: false,
-      element: null,
-      error: "",
-    };
-  }
-
-  const baseSelector = String(match[1] || "").trim();
-  const query = normalizeText(stripMatchingQuotes(match[2]));
-  if (!query) {
-    return {
-      matched: true,
-      element: null,
-      error: "",
-    };
-  }
-
-  let candidates = [];
-  if (baseSelector) {
-    try {
-      candidates = Array.from(document.querySelectorAll(baseSelector));
-    } catch (error) {
-      return {
-        matched: true,
-        element: null,
-        error: `Invalid selector: ${baseSelector}`,
-      };
-    }
-  } else {
-    candidates = collectSnapshotCandidateElements();
-  }
-
-  return {
-    matched: true,
-    element: findBestTextSelectorMatch(
-      candidates.filter((element) => element?.isConnected && isElementVisible(element)),
-      query,
-    ),
-    error: "",
-  };
-}
-
-function findBestTextSelectorMatch(candidates, query) {
-  let bestCandidate = null;
-  let bestScore = 0;
-
-  candidates.forEach((element) => {
-    const score = scoreTextSelectorMatch(element, query);
-    if (score > bestScore) {
-      bestCandidate = element;
-      bestScore = score;
-    }
-  });
-
-  return bestCandidate;
-}
-
-function scoreTextSelectorMatch(element, query) {
-  if (!(element instanceof Element)) {
-    return 0;
-  }
-
-  const values = [
-    getElementLabel(element),
-    getElementText(element),
-    element.getAttribute("aria-label"),
-    element.getAttribute("title"),
-    element.getAttribute("placeholder"),
-  ]
-    .map((value) => normalizeText(value))
-    .filter(Boolean);
-
-  let score = 0;
-  values.forEach((value) => {
-    if (value === query) {
-      score = Math.max(score, 100);
-    } else if (value.startsWith(query)) {
-      score = Math.max(score, 70 - Math.max(0, value.length - query.length));
-    } else if (value.includes(query)) {
-      const extraLength = Math.max(0, value.length - query.length);
-      if (query.length >= 3 || extraLength <= 2) {
-        score = Math.max(score, 40 - extraLength);
-      }
-    }
-  });
-
-  return score;
 }
 
 function descriptorMatchesFindKinds(descriptor, kinds) {
@@ -695,6 +909,23 @@ function descriptorMatchesFindKinds(descriptor, kinds) {
   const kind = String(descriptor.kind || "").toLowerCase();
   const tagName = String(descriptor.tagName || "").toLowerCase();
   return kinds.includes(kind) || kinds.includes(tagName);
+}
+
+function descriptorMatchesFindRegions(descriptor, regions) {
+  if (!Array.isArray(regions) || regions.length === 0) {
+    return true;
+  }
+
+  return descriptorMatchesAnyRegion(descriptor, regions);
+}
+
+function descriptorMatchesAnyRegion(descriptor, regions) {
+  if (!Array.isArray(regions) || regions.length === 0) {
+    return false;
+  }
+
+  const region = String(descriptor.region || "").toLowerCase();
+  return Boolean(region) && regions.includes(region);
 }
 
 function scoreDescriptorForFind(descriptor, query) {
@@ -739,6 +970,11 @@ function compareFindMatches(left, right) {
     return right.score - left.score;
   }
 
+  const navigationDelta = compareLeftNavDuplicateMatches(left, right);
+  if (navigationDelta !== 0) {
+    return navigationDelta;
+  }
+
   const topDelta = (left.rect?.y ?? 0) - (right.rect?.y ?? 0);
   if (topDelta !== 0) {
     return topDelta;
@@ -747,30 +983,154 @@ function compareFindMatches(left, right) {
   return (left.rect?.x ?? 0) - (right.rect?.x ?? 0);
 }
 
-function normalizeFindLimit(value) {
-  return normalizeFindLimitInput(value) || DEFAULT_FIND_RESULTS_LIMIT;
+function compareLeftNavDuplicateMatches(left, right) {
+  if (left.region !== "left_nav" || right.region !== "left_nav") {
+    return 0;
+  }
+
+  const leftLabel = descriptorLabel(left);
+  const rightLabel = descriptorLabel(right);
+  if (!leftLabel || leftLabel !== rightLabel) {
+    return 0;
+  }
+
+  const hrefDelta = Number(Boolean(right.href)) - Number(Boolean(left.href));
+  if (hrefDelta !== 0) {
+    return hrefDelta;
+  }
+
+  const ancestorDelta =
+    (Array.isArray(right.ancestors) ? right.ancestors.length : 0) -
+    (Array.isArray(left.ancestors) ? left.ancestors.length : 0);
+  if (ancestorDelta !== 0) {
+    return ancestorDelta;
+  }
+
+  const depthDelta = (right.rect?.x ?? 0) - (left.rect?.x ?? 0);
+  if (depthDelta !== 0) {
+    return depthDelta;
+  }
+
+  return 0;
 }
 
-function buildFindSummary(query, matches) {
+function normalizeFindLimit(value) {
+  if (value === null || value === undefined || value === "") {
+    return DEFAULT_FIND_RESULTS_LIMIT;
+  }
+
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return DEFAULT_FIND_RESULTS_LIMIT;
+  }
+
+  return Math.max(1, Math.min(MAX_FIND_RESULTS_LIMIT, Math.round(numeric)));
+}
+
+function buildFindSummary(query, matches, observationId = "") {
   if (!Array.isArray(matches) || matches.length === 0) {
-    return `Found no matching elements for "${truncateText(query, 80)}".`;
+    return `Found no matching elements for "${truncateText(query, 80)}"${
+      observationId ? ` in ${observationId}` : ""
+    }.`;
   }
 
   return `Found ${matches.length} matching element${
     matches.length === 1 ? "" : "s"
-  } for "${truncateText(query, 80)}".`;
+  } for "${truncateText(query, 80)}"${observationId ? ` in ${observationId}` : ""}.`;
 }
 
-function stripMatchingQuotes(value) {
-  const text = String(value || "").trim();
-  if (text.length >= 2) {
-    const first = text[0];
-    const last = text[text.length - 1];
-    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
-      return text.slice(1, -1);
+function matchesWaitCondition(until, snapshot) {
+  if (!until || typeof until !== "object") {
+    return true;
+  }
+
+  const urlIncludes = normalizeText(until.urlIncludes || "");
+  if (urlIncludes && !normalizeText(snapshot?.canonicalUrl || "").includes(urlIncludes)) {
+    return false;
+  }
+
+  const titleIncludes = normalizeText(until.titleIncludes || "");
+  if (titleIncludes && !normalizeText(snapshot?.pageTitle || "").includes(titleIncludes)) {
+    return false;
+  }
+
+  const textIncludes = normalizeText(until.textIncludes || "");
+  if (textIncludes && !normalizeText(snapshot?.textExcerpt || "").includes(textIncludes)) {
+    return false;
+  }
+
+  const query = normalizeText(until.query || "");
+  if (query) {
+    const matchedDescriptors = (snapshot?.elements || [])
+      .filter((descriptor) => descriptorMatchesFindKinds(descriptor, until.kinds))
+      .filter((descriptor) => descriptorMatchesFindRegions(descriptor, until.regions))
+      .filter(
+        (descriptor) =>
+          !descriptorMatchesAnyRegion(descriptor, until.excludeRegions),
+      )
+      .filter((descriptor) => scoreDescriptorForFind(descriptor, query) > 0);
+
+    if (until.state === "disappear") {
+      return matchedDescriptors.length === 0;
+    }
+
+    if (matchedDescriptors.length === 0) {
+      return false;
     }
   }
-  return text;
+
+  return true;
+}
+
+function scrollViewport(direction, amount) {
+  const viewportWidth = Math.max(
+    document.documentElement?.clientWidth || 0,
+    window.innerWidth || 0,
+  );
+  const viewportHeight = Math.max(
+    document.documentElement?.clientHeight || 0,
+    window.innerHeight || 0,
+  );
+  const delta =
+    typeof amount === "number"
+      ? Math.max(40, Math.abs(amount))
+      : amount === "viewport"
+        ? Math.max(120, viewportHeight)
+        : Math.max(120, Math.round(viewportHeight * 0.9));
+
+  switch (direction) {
+    case "up":
+      window.scrollBy({ top: -delta, left: 0, behavior: "auto" });
+      break;
+    case "left":
+      window.scrollBy({
+        top: 0,
+        left: -Math.max(80, Math.round(viewportWidth * 0.8)),
+        behavior: "auto",
+      });
+      break;
+    case "right":
+      window.scrollBy({
+        top: 0,
+        left: Math.max(80, Math.round(viewportWidth * 0.8)),
+        behavior: "auto",
+      });
+      break;
+    case "down":
+    default:
+      window.scrollBy({ top: delta, left: 0, behavior: "auto" });
+      break;
+  }
+}
+
+function formatScrollAmount(amount) {
+  if (typeof amount === "number") {
+    return `${Math.abs(amount)}px`;
+  }
+  if (amount === "viewport") {
+    return "one viewport";
+  }
+  return "one page";
 }
 
 function findSnapshotElementIdForNode(node) {
@@ -858,6 +1218,237 @@ function extractElementContent(element) {
         : truncateText(getRawElementValue(element), MAX_SELECTION_LENGTH),
     descriptor,
   };
+}
+
+function summarizeObservation(snapshot) {
+  if (!snapshot) {
+    return null;
+  }
+
+  return {
+    observationId: snapshot.observationId || "",
+    pageTitle: snapshot.pageTitle || "",
+    canonicalUrl: snapshot.canonicalUrl || "",
+    observedAt: snapshot.observedAt || Date.now(),
+    textExcerpt: truncateText(snapshot.textExcerpt || "", 200),
+    elementCount:
+      Number.isFinite(snapshot.elementCount) && snapshot.elementCount >= 0
+        ? snapshot.elementCount
+        : Array.isArray(snapshot.elements)
+          ? snapshot.elements.length
+          : 0,
+  };
+}
+
+function createActionRecord(action, beforeSnapshot, afterSnapshot, details) {
+  return {
+    actionId: nextActionId(),
+    createdAt: Date.now(),
+    action: sanitizeActionForHistory(action),
+    status: details?.ok ? "success" : "error",
+    summary: details?.summary || details?.error || action.action,
+    error: details?.ok ? "" : details?.error || "",
+    beforeSnapshot,
+    afterSnapshot,
+    diff: details?.diff || buildObservationDiff(beforeSnapshot, afterSnapshot),
+    target: details?.target || null,
+  };
+}
+
+function summarizeActionRecord(record) {
+  if (!record) {
+    return null;
+  }
+
+  return {
+    actionId: record.actionId,
+    createdAt: record.createdAt,
+    action: record.action,
+    status: record.status,
+    summary: record.summary,
+    error: record.error || "",
+    before: summarizeObservation(record.beforeSnapshot),
+    after: summarizeObservation(record.afterSnapshot),
+    diff: record.diff || null,
+    target: record.target || null,
+  };
+}
+
+function sanitizeActionForHistory(action) {
+  if (!action || typeof action !== "object") {
+    return { action: "" };
+  }
+
+  return {
+    action: action.action || "",
+    query: typeof action.query === "string" ? action.query : undefined,
+    kinds: Array.isArray(action.kinds) ? action.kinds : undefined,
+    regions: Array.isArray(action.regions) ? action.regions : undefined,
+    excludeRegions: Array.isArray(action.excludeRegions)
+      ? action.excludeRegions
+      : undefined,
+    target: action.target
+      ? {
+          observationId: action.target.observationId || undefined,
+          elementId: action.target.elementId || undefined,
+        }
+      : undefined,
+    key: typeof action.key === "string" ? action.key : undefined,
+    until: action.until || undefined,
+    direction: typeof action.direction === "string" ? action.direction : undefined,
+    amount:
+      typeof action.amount === "number" || typeof action.amount === "string"
+        ? action.amount
+        : undefined,
+    timeoutMs:
+      Number.isFinite(action.timeoutMs) && action.timeoutMs > 0
+        ? action.timeoutMs
+        : undefined,
+    text:
+      typeof action.text === "string"
+        ? truncateText(action.text, 80)
+        : undefined,
+    clear: action.clear === false ? false : undefined,
+    submit: action.submit === true ? true : undefined,
+  };
+}
+
+function buildObservationDiff(beforeSnapshot, afterSnapshot) {
+  const before = beforeSnapshot || null;
+  const after = afterSnapshot || null;
+  const beforeLabels = collectObservationLabels(before);
+  const afterLabels = collectObservationLabels(after);
+  const added = [...afterLabels].filter((label) => !beforeLabels.has(label));
+  const removed = [...beforeLabels].filter((label) => !afterLabels.has(label));
+
+  return {
+    changed: Boolean(
+      !before ||
+        !after ||
+        before.pageTitle !== after.pageTitle ||
+        before.canonicalUrl !== after.canonicalUrl ||
+        before.textExcerpt !== after.textExcerpt ||
+        added.length > 0 ||
+        removed.length > 0,
+    ),
+    urlChanged: Boolean(before && after && before.canonicalUrl !== after.canonicalUrl),
+    titleChanged: Boolean(before && after && before.pageTitle !== after.pageTitle),
+    textChanged: Boolean(before && after && before.textExcerpt !== after.textExcerpt),
+    added: added.slice(0, MAX_DIFF_ITEMS),
+    removed: removed.slice(0, MAX_DIFF_ITEMS),
+  };
+}
+
+function collectObservationLabels(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.elements)) {
+    return new Set();
+  }
+
+  return new Set(
+    snapshot.elements
+      .map((descriptor) => descriptorLabel(descriptor))
+      .filter(Boolean),
+  );
+}
+
+function buildFindRelatedDescriptors(descriptor, allDescriptors) {
+  if (!descriptor || !Array.isArray(allDescriptors)) {
+    return [];
+  }
+
+  return allDescriptors
+    .filter((candidate) => candidate.id !== descriptor.id)
+    .map((candidate) => ({
+      descriptor: candidate,
+      score: scoreRelatedDescriptor(candidate, descriptor),
+    }))
+    .filter((entry) => entry.score > 0)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, MAX_FIND_RELATED_ITEMS)
+    .map((entry) => ({
+      elementId: entry.descriptor.id,
+      kind: entry.descriptor.kind,
+      text:
+        entry.descriptor.label ||
+        entry.descriptor.text ||
+        entry.descriptor.placeholder ||
+        entry.descriptor.href ||
+        "",
+      region: entry.descriptor.region || "",
+      active: entry.descriptor.active === true,
+      selected: entry.descriptor.selected === true,
+      expanded: entry.descriptor.expanded,
+    }));
+}
+
+function scoreRelatedDescriptor(candidate, focus) {
+  let score = 0;
+  if (candidate.region && candidate.region === focus.region) {
+    score += 3;
+  }
+
+  const focusAncestors = new Set(Array.isArray(focus.ancestors) ? focus.ancestors : []);
+  const sharedAncestors = (candidate.ancestors || []).filter((ancestor) =>
+    focusAncestors.has(ancestor),
+  );
+  score += sharedAncestors.length * 4;
+
+  if (candidate.kind === focus.kind) {
+    score += 1;
+  }
+
+  const deltaY = Math.abs((candidate.rect?.y ?? 0) - (focus.rect?.y ?? 0));
+  const deltaX = Math.abs((candidate.rect?.x ?? 0) - (focus.rect?.x ?? 0));
+  if (deltaY <= 220) {
+    score += 2;
+  }
+  if (deltaX <= 260) {
+    score += 1;
+  }
+
+  return score;
+}
+
+async function waitForPageSettle() {
+  let stableIterations = 0;
+  let previousSignature = buildPageSettleSignature();
+
+  for (let index = 0; index < ACTION_SETTLE_MAX_ITERATIONS; index += 1) {
+    await delay(ACTION_SETTLE_INTERVAL_MS);
+    const currentSignature = buildPageSettleSignature();
+    if (currentSignature === previousSignature) {
+      stableIterations += 1;
+      if (stableIterations >= ACTION_SETTLE_STABLE_ITERATIONS) {
+        break;
+      }
+    } else {
+      previousSignature = currentSignature;
+      stableIterations = 0;
+    }
+  }
+}
+
+function buildPageSettleSignature() {
+  return [
+    location.href,
+    document.title || "",
+    getDocumentTextExcerpt(),
+    document.querySelectorAll(SNAPSHOT_CANDIDATE_SELECTOR).length,
+  ].join("::");
+}
+
+function delay(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function descriptorLabel(descriptor) {
+  return normalizeText(
+    descriptor?.label ||
+      descriptor?.text ||
+      descriptor?.placeholder ||
+      descriptor?.href ||
+      "",
+  );
 }
 
 function inferElementKind(element, tagName, role, type) {
@@ -1265,11 +1856,20 @@ function getValueSetter(element) {
 }
 
 function dispatchKeyboardEnter(element) {
+  dispatchKeyboardKey(element, "Enter");
+}
+
+function dispatchKeyboardKey(element, key) {
+  const normalizedKey = String(key || "").trim();
+  if (!normalizedKey) {
+    return;
+  }
+
   const keyboardEventOptions = {
     bubbles: true,
     cancelable: true,
-    key: "Enter",
-    code: "Enter",
+    key: normalizedKey,
+    code: normalizedKey,
   };
   element.dispatchEvent(new KeyboardEvent("keydown", keyboardEventOptions));
   element.dispatchEvent(new KeyboardEvent("keyup", keyboardEventOptions));
