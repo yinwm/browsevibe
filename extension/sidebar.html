@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BrowseVibe</title>
+    <link rel="stylesheet" href="./sidebar.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header">
+        <div class="header-copy">
+          <p class="eyebrow">A browser agent for the web</p>
+          <h1>BrowseVibe</h1>
+        </div>
+        <div class="header-actions">
+          <div class="status-pill" id="connection-status">Disconnected</div>
+          <button
+            class="ghost-button compact-button"
+            id="settings-toggle"
+            type="button"
+            aria-expanded="false"
+            aria-controls="settings-card"
+          >
+            Settings
+          </button>
+        </div>
+      </header>
+
+      <section class="connection-strip">
+        <div class="connection-copy">
+          <div class="connection-label">Gateway</div>
+          <div class="connection-summary" id="connection-summary">ws://127.0.0.1:18790/pico/ws</div>
+          <p class="helper-text strip-status" id="bridge-status">
+            Save settings first. BrowseVibe connects directly to the local gateway over WebSocket.
+          </p>
+        </div>
+        <button class="primary-button compact-button" id="connect-toggle" type="button">Connect</button>
+      </section>
+
+      <section class="settings-card hidden" id="settings-card">
+        <div class="section-header settings-header">
+          <div>
+            <h2>Connection Settings</h2>
+            <p class="helper-text">These rarely change once the local gateway is set.</p>
+          </div>
+          <button class="ghost-button compact-button" id="save-settings" type="button">Save</button>
+        </div>
+
+        <label class="field">
+          <span>Gateway WS URL</span>
+          <input id="gateway-ws-url" type="text" placeholder="ws://127.0.0.1:18790/pico/ws" />
+        </label>
+
+        <label class="field">
+          <span>Gateway Pico Token</span>
+          <input id="gateway-pico-token" type="password" placeholder="pico-..." />
+        </label>
+      </section>
+
+      <section class="context-card">
+        <div class="section-header">
+          <h2>Current Tab</h2>
+          <div class="section-actions">
+            <button class="secondary-button compact-button" id="refresh-context" type="button">
+              Refresh
+            </button>
+            <label class="checkbox">
+              <input id="include-tab-context" type="checkbox" checked />
+              <span>Attach to prompts</span>
+            </label>
+          </div>
+        </div>
+
+        <div id="tab-context" class="context-body">
+          <p class="muted">No tab context loaded yet.</p>
+        </div>
+      </section>
+
+      <section class="automation-card">
+        <div class="section-header">
+          <div>
+            <h2>Browser Snapshot</h2>
+            <p class="helper-text" id="snapshot-status">
+              Refresh to inspect clickable and editable elements on the active page.
+            </p>
+          </div>
+          <button class="secondary-button compact-button" id="refresh-snapshot" type="button">
+            Scan
+          </button>
+        </div>
+
+        <div class="pending-action hidden" id="pending-browser-action">
+          <div class="pending-action-copy">
+            <strong id="pending-browser-action-title">Browser action approval</strong>
+            <p class="helper-text" id="pending-browser-action-summary">
+              The agent wants to interact with this page.
+            </p>
+          </div>
+          <div class="pending-action-actions">
+            <button
+              class="primary-button compact-button"
+              id="approve-browser-action"
+              type="button"
+            >
+              Allow This Page
+            </button>
+            <button
+              class="ghost-button compact-button"
+              id="reject-browser-action"
+              type="button"
+            >
+              Reject
+            </button>
+          </div>
+        </div>
+
+        <div id="browser-snapshot" class="snapshot-body">
+          <p class="muted">No browser snapshot loaded yet.</p>
+        </div>
+      </section>
+
+      <section class="chat-card">
+        <div class="section-header">
+          <h2>Conversation</h2>
+          <span class="muted" id="session-label"></span>
+        </div>
+
+        <div class="messages" id="messages"></div>
+
+        <div class="typing-indicator hidden" id="typing-indicator">Assistant is typing...</div>
+
+        <form class="composer" id="composer">
+          <textarea
+            id="message-input"
+            rows="4"
+            placeholder="Ask BrowseVibe to work on this page."
+          ></textarea>
+          <button class="primary-button" id="send-message" type="submit">Send</button>
+        </form>
+      </section>
+    </div>
+
+    <script type="module" src="./sidebar.js"></script>
+  </body>
+</html>
