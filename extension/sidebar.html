@@ -122,11 +122,36 @@
 
       <section class="chat-card">
         <div class="section-header">
-          <h2>Conversation</h2>
-          <span class="muted" id="session-label"></span>
+          <div>
+            <h2>Conversation</h2>
+            <span class="muted" id="session-label"></span>
+          </div>
+          <div class="section-actions thread-controls">
+            <select id="thread-picker" aria-label="Conversation threads"></select>
+            <button class="secondary-button compact-button" id="new-thread" type="button">
+              New Chat
+            </button>
+            <button class="ghost-button compact-button" id="export-thread" type="button">
+              Export
+            </button>
+          </div>
         </div>
 
-        <div class="messages" id="messages"></div>
+        <div class="messages-shell">
+          <div class="messages" id="messages"></div>
+          <button
+            class="message-jump hidden"
+            id="jump-to-latest"
+            type="button"
+            aria-label="Jump to latest messages"
+            title="Jump to latest messages"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 5v12"></path>
+              <path d="M7 12l5 5 5-5"></path>
+            </svg>
+          </button>
+        </div>
 
         <div class="typing-indicator hidden" id="typing-indicator">Assistant is typing...</div>
 

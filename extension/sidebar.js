@@ -5,17 +5,29 @@ const DEFAULT_CONFIG = {
 };
 const ACTIVE_TAB_CONTEXT_EVENT = "sidebar:active-tab-context-updated";
 const PAGE_SESSIONS_STORAGE_KEY = "pageSessions";
+const CONNECTION_INTENT_STORAGE_KEY = "shouldMaintainConnections";
 const MAX_LOCAL_MESSAGES_PER_SESSION = 200;
 const SESSION_SAVE_DELAY_MS = 250;
+const MESSAGE_COPY_RESET_DELAY_MS = 1600;
+const MESSAGE_BOTTOM_THRESHOLD_PX = 24;
+const DEFAULT_THREAD_TITLE = "New Chat";
 const MAX_PROMPT_SNAPSHOT_ELEMENTS = 12;
 const MAX_RENDERED_SNAPSHOT_ELEMENTS = 14;
 const BROWSER_ACTION_BLOCK_REGEX = /```browser-action\s*([\s\S]*?)```/i;
+const JSON_CODE_BLOCK_REGEX = /```(?:json)?\s*([\s\S]*?)```/gi;
 const SUPPORTED_BROWSER_ACTIONS = new Set([
   "browser.snapshot",
   "browser.extract",
+  "browser.find",
   "browser.click",
   "browser.type",
 ]);
+const MESSAGE_COPY_ICON = `
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <rect x="9" y="9" width="10" height="10" rx="2"></rect>
+    <path d="M7 15H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2v1"></path>
+  </svg>
+`;
 
 const state = {
   config: { ...DEFAULT_CONFIG },
@@ -63,10 +75,14 @@ const elements = {
   approveBrowserAction: document.querySelector("#approve-browser-action"),
   rejectBrowserAction: document.querySelector("#reject-browser-action"),
   messages: document.querySelector("#messages"),
+  jumpToLatest: document.querySelector("#jump-to-latest"),
   typingIndicator: document.querySelector("#typing-indicator"),
   composer: document.querySelector("#composer"),
   messageInput: document.querySelector("#message-input"),
   sessionLabel: document.querySelector("#session-label"),
+  threadPicker: document.querySelector("#thread-picker"),
+  newThread: document.querySelector("#new-thread"),
+  exportThread: document.querySelector("#export-thread"),
 };
 
 bootstrap().catch((error) => {
@@ -81,6 +97,7 @@ async function bootstrap() {
   bindEvents();
   renderConnectionSummary();
   renderSettingsCard();
+  renderThreadControls();
   renderSession();
   renderMessages();
   renderTyping();
@@ -93,6 +110,7 @@ async function loadConfig() {
   const stored = await chrome.storage.local.get({
     ...DEFAULT_CONFIG,
     [PAGE_SESSIONS_STORAGE_KEY]: {},
+    [CONNECTION_INTENT_STORAGE_KEY]: false,
   });
 
   state.config = {
@@ -103,6 +121,9 @@ async function loadConfig() {
   };
   state.pageSessions = normalizeStoredPageSessions(
     stored[PAGE_SESSIONS_STORAGE_KEY],
+  );
+  state.shouldMaintainConnections = Boolean(
+    stored[CONNECTION_INTENT_STORAGE_KEY],
   );
   state.settingsExpanded =
     !state.config.gatewayWsUrl || !state.config.gatewayPicoToken;
@@ -143,6 +164,25 @@ function bindEvents() {
     void connectActivePage();
   });
 
+  elements.threadPicker.addEventListener("change", (event) => {
+    if (!state.activePageKey) {
+      return;
+    }
+    void setActiveThreadForPage(state.activePageKey, event.target.value);
+  });
+
+  elements.newThread.addEventListener("click", () => {
+    if (!state.activePageKey) {
+      setBridgeStatus("No active page session is available.");
+      return;
+    }
+    void createNewThreadForPage(state.activePageKey);
+  });
+
+  elements.exportThread.addEventListener("click", () => {
+    exportActiveThread();
+  });
+
   elements.includeTabContext.addEventListener("change", async (event) => {
     state.config.includeTabContext = event.target.checked;
     await chrome.storage.local.set({
@@ -161,6 +201,14 @@ function bindEvents() {
   elements.composer.addEventListener("submit", (event) => {
     event.preventDefault();
     void sendMessage();
+  });
+
+  elements.messages.addEventListener("scroll", () => {
+    updateMessageJumpButton();
+  });
+
+  elements.jumpToLatest.addEventListener("click", () => {
+    scrollMessagesToBottom({ behavior: "smooth" });
   });
 
   chrome.runtime.onMessage.addListener((message) => {
@@ -293,6 +341,7 @@ async function connectActivePage() {
   }
 
   state.shouldMaintainConnections = true;
+  persistConnectionIntent();
   updateConnectionStateForActivePage();
   await ensureSocketForPage(state.activePageKey);
 }
@@ -300,6 +349,7 @@ async function connectActivePage() {
 function disconnectAllSockets() {
   const sockets = Object.values(state.socketEntries).map((entry) => entry.socket);
   state.shouldMaintainConnections = false;
+  persistConnectionIntent();
   state.socketEntries = {};
   state.typingByPageKey = {};
   renderTyping();
@@ -314,17 +364,22 @@ function disconnectAllSockets() {
   });
 }
 
-async function ensureSocketForPage(pageKey) {
+async function ensureSocketForPage(pageKey, options = {}) {
   if (!state.shouldMaintainConnections) {
     return;
   }
 
-  const session = state.pageSessions[pageKey];
-  if (!session) {
+  const threadId =
+    typeof options.threadId === "string" && options.threadId
+      ? options.threadId
+      : getActiveThreadId(pageKey);
+  const thread = getPageSessionThread(pageKey, threadId);
+  if (!thread) {
     return;
   }
 
-  const existingEntry = state.socketEntries[pageKey];
+  const threadStorageKey = buildThreadStorageKey(pageKey, thread.threadId);
+  const existingEntry = state.socketEntries[threadStorageKey];
   if (
     existingEntry &&
     (existingEntry.socket.readyState === WebSocket.OPEN ||
@@ -334,38 +389,43 @@ async function ensureSocketForPage(pageKey) {
     return;
   }
 
-  const wsUrl = buildGatewayWsUrl(state.config.gatewayWsUrl, session.sessionId);
+  const wsUrl = buildGatewayWsUrl(state.config.gatewayWsUrl, thread.sessionId);
   const socket = new WebSocket(wsUrl, [`token.${state.config.gatewayPicoToken}`]);
-  state.socketEntries[pageKey] = {
+  state.socketEntries[threadStorageKey] = {
     socket,
     connectionState: "connecting",
+    pageKey,
+    threadId: thread.threadId,
   };
   updateConnectionStateForActivePage();
 
   socket.addEventListener("open", () => {
-    const entry = state.socketEntries[pageKey];
+    const entry = state.socketEntries[threadStorageKey];
     if (!entry || entry.socket !== socket) {
       return;
     }
     entry.connectionState = "connected";
-    if (pageKey === state.activePageKey) {
+    if (threadStorageKey === getActiveThreadStorageKey()) {
       setBridgeStatus("Connected directly to the local gateway.");
     }
     updateConnectionStateForActivePage();
   });
 
   socket.addEventListener("message", (event) => {
-    handleIncomingMessage(pageKey, event.data);
+    handleIncomingMessage(pageKey, thread.threadId, event.data);
   });
 
   socket.addEventListener("close", () => {
-    const entry = state.socketEntries[pageKey];
+    const entry = state.socketEntries[threadStorageKey];
     if (!entry || entry.socket !== socket) {
       return;
     }
-    delete state.socketEntries[pageKey];
-    delete state.typingByPageKey[pageKey];
-    if (pageKey === state.activePageKey && state.shouldMaintainConnections) {
+    delete state.socketEntries[threadStorageKey];
+    delete state.typingByPageKey[threadStorageKey];
+    if (
+      threadStorageKey === getActiveThreadStorageKey() &&
+      state.shouldMaintainConnections
+    ) {
       setBridgeStatus("Disconnected from gateway.");
     }
     renderTyping();
@@ -373,12 +433,12 @@ async function ensureSocketForPage(pageKey) {
   });
 
   socket.addEventListener("error", () => {
-    const entry = state.socketEntries[pageKey];
+    const entry = state.socketEntries[threadStorageKey];
     if (!entry || entry.socket !== socket) {
       return;
     }
     entry.connectionState = "error";
-    if (pageKey === state.activePageKey) {
+    if (threadStorageKey === getActiveThreadStorageKey()) {
       setBridgeStatus("WebSocket connection failed.");
     }
     updateConnectionStateForActivePage();
@@ -425,29 +485,42 @@ async function sendMessage() {
   elements.messageInput.value = "";
 }
 
-async function sendSessionUserMessage(pageKey, displayContent, transportContent) {
+async function sendSessionUserMessage(
+  pageKey,
+  displayContent,
+  transportContent,
+  options = {},
+) {
   if (!pageKey) {
     return false;
   }
 
-  await ensureSocketForPage(pageKey);
+  const threadId =
+    typeof options.threadId === "string" && options.threadId
+      ? options.threadId
+      : getActiveThreadId(pageKey);
 
-  const socket = state.socketEntries[pageKey]?.socket;
+  await ensureSocketForPage(pageKey, { threadId });
+
+  const thread = getPageSessionThread(pageKey, threadId);
+  const threadStorageKey = thread
+    ? buildThreadStorageKey(pageKey, thread.threadId)
+    : "";
+  const socket = threadStorageKey ? state.socketEntries[threadStorageKey]?.socket : null;
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     setBridgeStatus("The active page session is not connected yet.");
     setConnectionState("error");
     return false;
   }
 
-  const session = state.pageSessions[pageKey];
-  if (!session) {
+  if (!thread) {
     setBridgeStatus("No active page session is available.");
     setConnectionState("error");
     return false;
   }
 
   const messageId = crypto.randomUUID();
-  upsertSessionMessage(pageKey, {
+  upsertSessionMessage(pageKey, thread.threadId, {
     id: messageId,
     role: "user",
     content: displayContent,
@@ -458,7 +531,7 @@ async function sendSessionUserMessage(pageKey, displayContent, transportContent)
     JSON.stringify({
       type: "message.send",
       id: messageId,
-      session_id: session.sessionId,
+      session_id: thread.sessionId,
       payload: {
         content: transportContent ?? displayContent,
       },
@@ -481,6 +554,7 @@ function applyTabContext(context) {
     void refreshBrowserSnapshot({ silent: true });
   }
 
+  renderThreadControls();
   renderSession();
   renderMessages();
   renderTyping();
@@ -495,9 +569,22 @@ function applyTabContext(context) {
 
 function upsertPageSession(pageKey, context) {
   const existing = state.pageSessions[pageKey];
+  const existingThreads =
+    existing?.threads && typeof existing.threads === "object"
+      ? { ...existing.threads }
+      : {};
+  let activeThreadId =
+    typeof existing?.activeThreadId === "string" ? existing.activeThreadId : "";
+
+  if (!activeThreadId || !existingThreads[activeThreadId]) {
+    const nextThread = createThreadRecord();
+    existingThreads[nextThread.threadId] = nextThread;
+    activeThreadId = nextThread.threadId;
+  }
+
   const nextSession = {
-    sessionId: existing?.sessionId || crypto.randomUUID(),
-    messages: Array.isArray(existing?.messages) ? existing.messages : [],
+    activeThreadId,
+    threads: existingThreads,
     tabId: context?.tabId ?? existing?.tabId ?? null,
     title: context?.title || context?.pageTitle || existing?.title || "",
     url:
@@ -514,7 +601,7 @@ function upsertPageSession(pageKey, context) {
   schedulePageSessionsSave();
 }
 
-function handleIncomingMessage(pageKey, raw) {
+function handleIncomingMessage(pageKey, threadId, raw) {
   let message;
   try {
     message = JSON.parse(raw);
@@ -530,44 +617,44 @@ function handleIncomingMessage(pageKey, raw) {
 
   switch (message.type) {
     case "message.create":
-      upsertSessionMessage(pageKey, {
+      upsertSessionMessage(pageKey, threadId, {
         id: messageId,
         role: "assistant",
         content,
         timestamp,
       });
-      handleAssistantBrowserAction(pageKey, messageId, content);
-      setTypingState(pageKey, false);
+      handleAssistantBrowserAction(pageKey, threadId, messageId, content);
+      setTypingState(pageKey, threadId, false);
       break;
     case "message.update":
-      upsertSessionMessage(pageKey, {
+      upsertSessionMessage(pageKey, threadId, {
         id: messageId,
         role: "assistant",
         content,
         timestamp,
       });
-      handleAssistantBrowserAction(pageKey, messageId, content);
+      handleAssistantBrowserAction(pageKey, threadId, messageId, content);
       break;
     case "typing.start":
-      setTypingState(pageKey, true);
+      setTypingState(pageKey, threadId, true);
       break;
     case "typing.stop":
-      setTypingState(pageKey, false);
+      setTypingState(pageKey, threadId, false);
       break;
     case "error":
-      if (pageKey === state.activePageKey) {
+      if (buildThreadStorageKey(pageKey, threadId) === getActiveThreadStorageKey()) {
         setBridgeStatus(
           payload.message || payload.code || "The gateway returned an error",
         );
       }
-      setTypingState(pageKey, false);
+      setTypingState(pageKey, threadId, false);
       break;
     default:
       console.debug("Unhandled pico message", message);
   }
 }
 
-function handleAssistantBrowserAction(pageKey, messageId, content) {
+function handleAssistantBrowserAction(pageKey, threadId, messageId, content) {
   const request = extractBrowserActionFromContent(content);
   if (!request) {
     return;
@@ -575,12 +662,7 @@ function handleAssistantBrowserAction(pageKey, messageId, content) {
 
   const signature = JSON.stringify(request);
   const existing = state.browserActionRequests[messageId];
-  if (
-    existing &&
-    existing.signature === signature &&
-    existing.status !== "error" &&
-    existing.status !== "dismissed"
-  ) {
+  if (existing && existing.signature === signature) {
     return;
   }
 
@@ -589,6 +671,8 @@ function handleAssistantBrowserAction(pageKey, messageId, content) {
     [messageId]: {
       messageId,
       pageKey,
+      threadId,
+      threadStorageKey: buildThreadStorageKey(pageKey, threadId),
       request,
       signature,
       status: "parsed",
@@ -601,14 +685,18 @@ function handleAssistantBrowserAction(pageKey, messageId, content) {
   renderMessages();
   renderPendingBrowserAction();
 
-  if (pageKey === state.activePageKey) {
+  if (buildThreadStorageKey(pageKey, threadId) === getActiveThreadStorageKey()) {
     void executeBrowserActionRequest(messageId);
   }
 }
 
 async function executeBrowserActionRequest(messageId) {
   const entry = state.browserActionRequests[messageId];
-  if (!entry || entry.status === "executing" || entry.pageKey !== state.activePageKey) {
+  if (
+    !entry ||
+    entry.status === "executing" ||
+    entry.threadStorageKey !== getActiveThreadStorageKey()
+  ) {
     return;
   }
 
@@ -684,8 +772,8 @@ async function executeBrowserActionRequest(messageId) {
   await sendBrowserActionFollowup(messageId, "success");
 }
 
-async function approvePendingBrowserAction() {
-  const pending = getPendingBrowserActionRequest();
+async function approvePendingBrowserAction(messageId = "") {
+  const pending = getPendingBrowserActionRequestById(messageId);
   if (!pending?.approval?.pageKey) {
     return;
   }
@@ -714,8 +802,8 @@ async function approvePendingBrowserAction() {
   void executeBrowserActionRequest(pending.messageId);
 }
 
-async function rejectPendingBrowserAction() {
-  const pending = getPendingBrowserActionRequest();
+async function rejectPendingBrowserAction(messageId = "") {
+  const pending = getPendingBrowserActionRequestById(messageId);
   if (!pending) {
     return;
   }
@@ -733,7 +821,7 @@ async function rejectPendingBrowserAction() {
 
 async function sendBrowserActionFollowup(messageId, outcome) {
   const entry = state.browserActionRequests[messageId];
-  if (!entry || entry.pageKey !== state.activePageKey) {
+  if (!entry) {
     return;
   }
 
@@ -742,6 +830,7 @@ async function sendBrowserActionFollowup(messageId, outcome) {
     entry.pageKey,
     followupContent,
     followupContent,
+    { threadId: entry.threadId },
   );
 
   if (!sent) {
@@ -766,9 +855,10 @@ function updateBrowserActionRequest(messageId, patch) {
   };
 }
 
-function upsertSessionMessage(pageKey, message) {
-  const session = state.pageSessions[pageKey];
-  if (!session) {
+function upsertSessionMessage(pageKey, threadId, message) {
+  const scope = state.pageSessions[pageKey];
+  const session = scope?.threads?.[threadId];
+  if (!scope || !session) {
     return;
   }
 
@@ -785,42 +875,60 @@ function upsertSessionMessage(pageKey, message) {
   }
 
   const trimmedMessages = messages.slice(-MAX_LOCAL_MESSAGES_PER_SESSION);
+  const nextTitle =
+    message.role === "user" && isDefaultThreadTitle(session.title)
+      ? deriveThreadTitleFromMessage(message.content)
+      : session.title;
   state.pageSessions = {
     ...state.pageSessions,
     [pageKey]: {
-      ...session,
-      messages: trimmedMessages,
+      ...scope,
+      threads: {
+        ...scope.threads,
+        [threadId]: {
+          ...session,
+          title: nextTitle,
+          messages: trimmedMessages,
+          updatedAt: Date.now(),
+        },
+      },
       updatedAt: Date.now(),
     },
   };
 
   schedulePageSessionsSave();
-  if (pageKey === state.activePageKey) {
+  if (buildThreadStorageKey(pageKey, threadId) === getActiveThreadStorageKey()) {
+    renderThreadControls();
+    renderSession();
     renderMessages();
   }
 }
 
-function setTypingState(pageKey, isTyping) {
+function setTypingState(pageKey, threadId, isTyping) {
+  const threadStorageKey = buildThreadStorageKey(pageKey, threadId);
   if (isTyping) {
-    state.typingByPageKey[pageKey] = true;
+    state.typingByPageKey[threadStorageKey] = true;
   } else {
-    delete state.typingByPageKey[pageKey];
+    delete state.typingByPageKey[threadStorageKey];
   }
 
-  if (pageKey === state.activePageKey) {
+  if (threadStorageKey === getActiveThreadStorageKey()) {
     renderTyping();
   }
 }
 
 function renderMessages() {
+  const previousScrollTop = elements.messages.scrollTop;
+  const shouldStickToBottom = isMessagesNearBottom();
   elements.messages.innerHTML = "";
 
   const activeSession = getActivePageSession();
   const localMessages = Array.isArray(activeSession?.messages)
     ? activeSession.messages
     : [];
-  const remoteMessages = state.activePageKey
-    ? state.remoteHistories[state.activePageKey] || []
+  const activeThreadStorageKey = getActiveThreadStorageKey();
+  const remoteMessages = activeThreadStorageKey
+    ? state.remoteHistories[activeThreadStorageKey] || []
     : [];
   const messages =
     remoteMessages.length > 0
@@ -832,8 +940,12 @@ function renderMessages() {
     emptyState.className = "muted";
     emptyState.textContent = "No messages yet.";
     elements.messages.appendChild(emptyState);
+    elements.messages.scrollTop = 0;
+    updateMessageJumpButton();
     return;
   }
+
+  const pendingRequest = getPendingBrowserActionRequest();
 
   messages.forEach((message) => {
     const browserAction = extractBrowserActionFromContent(message.content);
@@ -847,7 +959,10 @@ function renderMessages() {
       container.classList.add("action-request");
     }
 
+    container.appendChild(createMessageCopyButton(message));
+
     const body = document.createElement("div");
+    body.className = "message-body";
     body.textContent = browserAction
       ? summarizeBrowserActionForChat(browserAction, requestState)
       : message.content;
@@ -858,15 +973,165 @@ function renderMessages() {
     meta.textContent = buildMessageMeta(message.timestamp, requestState);
     container.appendChild(meta);
 
+    if (
+      requestState?.status === "needs_approval" &&
+      requestState.messageId === pendingRequest?.messageId
+    ) {
+      container.appendChild(createInlineApprovalPanel(requestState));
+    }
+
     elements.messages.appendChild(container);
   });
 
-  elements.messages.scrollTop = elements.messages.scrollHeight;
+  if (shouldStickToBottom) {
+    scrollMessagesToBottom();
+    return;
+  }
+
+  const maxScrollTop = Math.max(
+    0,
+    elements.messages.scrollHeight - elements.messages.clientHeight,
+  );
+  elements.messages.scrollTop = Math.min(previousScrollTop, maxScrollTop);
+  updateMessageJumpButton();
+}
+
+function createMessageCopyButton(message) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "message-copy";
+  button.setAttribute("aria-label", "Copy message");
+  button.title = "Copy message";
+  button.innerHTML = `${MESSAGE_COPY_ICON}<span class="message-copy-label">Copied</span>`;
+
+  let resetTimer = null;
+  button.addEventListener("click", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    try {
+      await copyTextToClipboard(String(message.content || ""));
+      setMessageCopyButtonState(button, true);
+      if (resetTimer) {
+        clearTimeout(resetTimer);
+      }
+      resetTimer = setTimeout(() => {
+        if (button.isConnected) {
+          setMessageCopyButtonState(button, false);
+        }
+      }, MESSAGE_COPY_RESET_DELAY_MS);
+    } catch (error) {
+      console.warn("Failed to copy message", error);
+      button.setAttribute("aria-label", "Copy failed");
+      button.title = "Copy failed";
+    }
+  });
+
+  return button;
+}
+
+function setMessageCopyButtonState(button, isCopied) {
+  button.dataset.state = isCopied ? "copied" : "idle";
+  button.setAttribute(
+    "aria-label",
+    isCopied ? "Message copied" : "Copy message",
+  );
+  button.title = isCopied ? "Copied" : "Copy message";
+}
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.top = "-9999px";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+
+  try {
+    const copied = document.execCommand("copy");
+    if (!copied) {
+      throw new Error("execCommand copy returned false");
+    }
+  } finally {
+    textarea.remove();
+  }
+}
+
+function isMessagesNearBottom() {
+  const distanceFromBottom =
+    elements.messages.scrollHeight -
+    elements.messages.scrollTop -
+    elements.messages.clientHeight;
+  return distanceFromBottom <= MESSAGE_BOTTOM_THRESHOLD_PX;
+}
+
+function updateMessageJumpButton() {
+  const hasOverflow =
+    elements.messages.scrollHeight >
+    elements.messages.clientHeight + MESSAGE_BOTTOM_THRESHOLD_PX;
+  const shouldShow = hasOverflow && !isMessagesNearBottom();
+  elements.jumpToLatest.classList.toggle("hidden", !shouldShow);
+}
+
+function scrollMessagesToBottom(options = {}) {
+  const top = elements.messages.scrollHeight;
+  if (typeof elements.messages.scrollTo === "function") {
+    elements.messages.scrollTo({
+      top,
+      behavior: options.behavior || "auto",
+    });
+  } else {
+    elements.messages.scrollTop = top;
+  }
+  updateMessageJumpButton();
+}
+
+function createInlineApprovalPanel(requestState) {
+  const panel = document.createElement("div");
+  panel.className = "message-approval-panel";
+
+  const summary = document.createElement("p");
+  summary.className = "message-approval-summary";
+  summary.textContent = `Allow ${summarizeBrowserActionRequest(
+    requestState.request,
+  )} on this page?`;
+  panel.appendChild(summary);
+
+  const actions = document.createElement("div");
+  actions.className = "message-approval-actions";
+
+  const approve = document.createElement("button");
+  approve.type = "button";
+  approve.className = "primary-button compact-button";
+  approve.textContent = "Allow This Page";
+  approve.addEventListener("click", () => {
+    void approvePendingBrowserAction(requestState.messageId);
+  });
+  actions.appendChild(approve);
+
+  const reject = document.createElement("button");
+  reject.type = "button";
+  reject.className = "ghost-button compact-button";
+  reject.textContent = "Reject";
+  reject.addEventListener("click", () => {
+    void rejectPendingBrowserAction(requestState.messageId);
+  });
+  actions.appendChild(reject);
+
+  panel.appendChild(actions);
+  return panel;
 }
 
 function renderTyping() {
   const isTyping = Boolean(
-    state.activePageKey && state.typingByPageKey[state.activePageKey],
+    getActiveThreadStorageKey() && state.typingByPageKey[getActiveThreadStorageKey()],
   );
   elements.typingIndicator.classList.toggle("hidden", !isTyping);
 }
@@ -1007,38 +1272,114 @@ function renderBrowserSnapshot() {
 }
 
 function renderPendingBrowserAction() {
-  const pending = getPendingBrowserActionRequest();
-  const isVisible = Boolean(pending);
+  elements.pendingBrowserAction.classList.add("hidden");
+}
 
-  elements.pendingBrowserAction.classList.toggle("hidden", !isVisible);
-  if (!pending) {
+function renderThreadControls() {
+  const scope = getPageSessionScope(state.activePageKey);
+  const threads = state.activePageKey ? getPageSessionThreads(state.activePageKey) : [];
+
+  elements.threadPicker.innerHTML = "";
+  elements.threadPicker.disabled = threads.length === 0;
+  elements.newThread.disabled = !state.activePageKey;
+  elements.exportThread.disabled = !getActivePageSession();
+
+  if (threads.length === 0) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "No chats";
+    elements.threadPicker.appendChild(option);
     return;
   }
 
-  const pageLabel =
-    state.currentTabContext?.title ||
-    state.currentTabContext?.pageTitle ||
-    state.currentTabContext?.url ||
-    "this page";
+  threads.forEach((thread) => {
+    const option = document.createElement("option");
+    option.value = thread.threadId;
+    option.textContent = buildThreadOptionLabel(thread);
+    option.selected = thread.threadId === scope?.activeThreadId;
+    elements.threadPicker.appendChild(option);
+  });
+}
 
-  elements.pendingBrowserActionTitle.textContent = "Browser action approval";
-  elements.pendingBrowserActionSummary.textContent = `Allow ${summarizeBrowserActionRequest(
-    pending.request,
-  )} on ${pageLabel}. Once approved, later click/type actions on this page run automatically until the URL changes.`;
+function exportActiveThread() {
+  const pageKey = state.activePageKey;
+  const thread = getActivePageSession();
+  if (!pageKey || !thread) {
+    setBridgeStatus("No conversation is available to export.");
+    return;
+  }
+
+  const scope = getPageSessionScope(pageKey);
+  const threadStorageKey = getActiveThreadStorageKey();
+  const localMessages = Array.isArray(thread.messages) ? thread.messages : [];
+  const remoteMessages = threadStorageKey
+    ? state.remoteHistories[threadStorageKey] || []
+    : [];
+  const mergedMessages =
+    remoteMessages.length > 0
+      ? mergeHistoryMessages(remoteMessages, localMessages)
+      : localMessages;
+  const browserActionRequests = Object.values(state.browserActionRequests)
+    .filter((entry) => entry.threadStorageKey === threadStorageKey)
+    .sort((left, right) => left.createdAt - right.createdAt)
+    .map((entry) => ({
+      messageId: entry.messageId,
+      request: entry.request,
+      status: entry.status,
+      error: entry.error || "",
+      approval: entry.approval || null,
+      result: entry.result || null,
+      createdAt: entry.createdAt,
+      updatedAt: entry.updatedAt,
+    }));
+
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    scope: {
+      pageKey,
+      tabId: scope?.tabId ?? null,
+      title: scope?.title || "",
+      url: scope?.url || "",
+    },
+    thread: {
+      threadId: thread.threadId,
+      sessionId: thread.sessionId,
+      title: thread.title,
+      createdAt: thread.createdAt,
+      updatedAt: thread.updatedAt,
+    },
+    currentTabContext: state.currentTabContext || null,
+    browserSnapshot: getActiveBrowserSnapshot(),
+    history: {
+      syncStatus: threadStorageKey
+        ? state.historySyncStatus[threadStorageKey] || "idle"
+        : "idle",
+      localMessageCount: localMessages.length,
+      remoteMessageCount: remoteMessages.length,
+      mergedMessageCount: mergedMessages.length,
+    },
+    messages: mergedMessages,
+    browserActionRequests,
+  };
+
+  const filename = buildThreadExportFilename(scope, thread);
+  downloadJsonFile(filename, payload);
+  setBridgeStatus(`Exported conversation to ${filename}.`);
 }
 
 function renderSession() {
   const activeSession = getActivePageSession();
   if (!activeSession) {
-    elements.sessionLabel.textContent = "No page session";
+    elements.sessionLabel.textContent = "No conversation selected";
     return;
   }
 
+  const scope = getPageSessionScope(state.activePageKey);
   const tabLabel =
-    activeSession.tabId === null || activeSession.tabId === undefined
+    scope?.tabId === null || scope?.tabId === undefined
       ? ""
-      : `tab ${activeSession.tabId} `;
-  elements.sessionLabel.textContent = `${tabLabel}session ${activeSession.sessionId.slice(
+      : `tab ${scope.tabId} • `;
+  elements.sessionLabel.textContent = `${tabLabel}${activeSession.title} • session ${activeSession.sessionId.slice(
     0,
     8,
   )}`;
@@ -1050,8 +1391,9 @@ function updateConnectionStateForActivePage() {
     return;
   }
 
-  const activeEntry = state.activePageKey
-    ? state.socketEntries[state.activePageKey]
+  const activeThreadStorageKey = getActiveThreadStorageKey();
+  const activeEntry = activeThreadStorageKey
+    ? state.socketEntries[activeThreadStorageKey]
     : null;
   setConnectionState(activeEntry?.connectionState || "disconnected");
 }
@@ -1156,12 +1498,26 @@ function buildPrompt(userMessage, context, snapshot, includeContext) {
     ...sections,
     "",
     "[Browser automation]",
-    "You can request local browser actions by replying with exactly one fenced browser-action JSON block and no extra prose.",
-    "Supported actions: browser.snapshot, browser.extract, browser.click, browser.type.",
-    "Use the current active tab only. Prefer target.elementId from the Browser snapshot and include target.selector as a fallback when available.",
-    "click/type may require a one-time user approval for this page. Sensitive inputs such as password or payment fields are blocked.",
-    "After every browser action, you will receive a Browser action result as a follow-up user message.",
-    'Example: ```browser-action {"action":"browser.click","target":{"elementId":"el-2","selector":"button[data-testid=\\"continue\\"]"}}```',
+    "You have access to exactly five local browser actions on the active HTTP(S) tab only.",
+    "Respond with normal prose unless you need the browser to inspect or act on the page.",
+    "If you need a browser action, reply with exactly one fenced browser-action JSON block and no extra prose.",
+    'The block must contain valid JSON with an "action" field. Never include more than one browser-action block in a single response.',
+    "Supported actions and expected JSON shapes:",
+    'browser.snapshot -> {"action":"browser.snapshot"}',
+    'browser.extract -> {"action":"browser.extract"} or {"action":"browser.extract","target":{"elementId":"el-2","selector":"main article"}}',
+    'browser.find -> {"action":"browser.find","query":"线索","kinds":["button","link"],"limit":8}',
+    'browser.click -> {"action":"browser.click","target":{"elementId":"el-2","selector":"button[data-testid=\\"continue\\"]"}}',
+    'browser.type -> {"action":"browser.type","target":{"elementId":"el-3","selector":"input[name=\\"email\\"]"},"text":"user@example.com","clear":true,"submit":false}',
+    "For browser.find, query is required. kinds is optional and filters by element kind. limit is optional. browser.find results include elementId plus context such as region, ancestors, and active state when available.",
+    "For browser.click and browser.type, target is required.",
+    "For browser.type, text is required. clear defaults to true; set clear:false to append instead of replace. submit is optional and presses Enter after typing.",
+    'Prefer target.elementId from the latest Browser snapshot and include target.selector as a fallback when available. target.selector must be either a valid CSS selector for document.querySelector or a visible-text selector like "text=线索".',
+    "If the current Browser snapshot is missing or outdated, request browser.snapshot first. If the page is complex or the target is not visible in the snapshot, use browser.find before browser.click.",
+    "browser.click and browser.type may require one-time user approval for the current page.",
+    "Sensitive inputs such as password, payment, OTP, and token fields are blocked for browser.type.",
+    "Never wrap browser actions inside exec, shell, run, cat, or any other tool call. Reply with the browser-action JSON block directly.",
+    "When the user asks for a multi-step browser task, continue one browser action at a time after each Browser action result until the user's stop condition is reached.",
+    "After every browser action, wait for the next Browser action result message and updated Browser snapshot before deciding the next step.",
     "",
     "[Browser snapshot]",
     snapshotText || "No browser snapshot is available yet. Request browser.snapshot before acting on the page.",
@@ -1172,7 +1528,14 @@ function buildBrowserActionFollowup(entry, outcome) {
   const lines = ["[Browser action result]"];
   lines.push(`Status: ${outcome}`);
   lines.push(`Action: ${entry.request.action}`);
-  lines.push(`Target: ${formatBrowserActionTarget(entry)}`);
+  const target = formatBrowserActionTarget(entry);
+  const query = formatBrowserActionQuery(entry);
+  if (target) {
+    lines.push(`Target: ${target}`);
+  }
+  if (query) {
+    lines.push(`Query: ${query}`);
+  }
 
   if (outcome === "success") {
     if (entry.result?.summary) {
@@ -1185,6 +1548,12 @@ function buildBrowserActionFollowup(entry, outcome) {
   }
 
   const snapshot = entry.result?.snapshot || getActiveBrowserSnapshot();
+  const findResults = formatBrowserFindResultsForPrompt(entry.result?.matches);
+  if (findResults) {
+    lines.push("");
+    lines.push("[Browser find results]");
+    lines.push(findResults);
+  }
   if (snapshot) {
     lines.push("");
     lines.push("[Browser snapshot]");
@@ -1192,9 +1561,29 @@ function buildBrowserActionFollowup(entry, outcome) {
   }
 
   lines.push("");
-  lines.push(
-    "Continue from this browser state. If another browser action is needed, respond with exactly one browser-action JSON block and no extra prose.",
-  );
+  if (outcome === "success") {
+    lines.push(
+      "A fresh Browser snapshot is already included above. Do not request browser.snapshot again unless the page changed or this snapshot is insufficient.",
+    );
+    if (entry.request.action === "browser.find") {
+      lines.push(
+        "If you want to act on one of the found elements, prefer its elementId in the next browser.click or browser.type request.",
+      );
+    }
+    lines.push(
+      "Continue from this browser state. If another browser action is needed, respond with exactly one browser-action JSON block and no extra prose.",
+    );
+  } else {
+    lines.push(
+      "The last browser action failed. Fix the request before retrying and do not repeat the same invalid action payload.",
+    );
+    lines.push(
+      'If you need to target a snapshot element, prefer {"target":{"elementId":"el-7"}} or include a selector like {"target":{"selector":"text=进入线索管理"}}.',
+    );
+    lines.push(
+      "Continue from this browser state. If another browser action is needed, respond with exactly one corrected browser-action JSON block and no extra prose.",
+    );
+  }
   return lines.join("\n");
 }
 
@@ -1202,10 +1591,26 @@ function getPendingBrowserActionRequest() {
   const entries = Object.values(state.browserActionRequests)
     .filter(
       (entry) =>
-        entry.pageKey === state.activePageKey && entry.status === "needs_approval",
+        entry.threadStorageKey === getActiveThreadStorageKey() &&
+        entry.status === "needs_approval",
     )
     .sort((left, right) => right.updatedAt - left.updatedAt);
   return entries[0] || null;
+}
+
+function getPendingBrowserActionRequestById(messageId) {
+  if (messageId) {
+    const entry = state.browserActionRequests[messageId];
+    if (
+      entry &&
+      entry.threadStorageKey === getActiveThreadStorageKey() &&
+      entry.status === "needs_approval"
+    ) {
+      return entry;
+    }
+  }
+
+  return getPendingBrowserActionRequest();
 }
 
 function getActiveBrowserSnapshot() {
@@ -1220,17 +1625,40 @@ function extractBrowserActionFromContent(content) {
     return null;
   }
 
-  const match = content.match(BROWSER_ACTION_BLOCK_REGEX);
-  if (!match?.[1]) {
+  const candidates = [];
+  const browserActionMatch = content.match(BROWSER_ACTION_BLOCK_REGEX);
+  if (browserActionMatch?.[1]) {
+    candidates.push(browserActionMatch[1]);
+  }
+
+  for (const match of content.matchAll(JSON_CODE_BLOCK_REGEX)) {
+    if (match?.[1]) {
+      candidates.push(match[1]);
+    }
+  }
+
+  const trimmed = content.trim();
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    candidates.push(trimmed);
+  }
+
+  if (candidates.length === 0) {
     return null;
   }
 
-  try {
-    const parsed = JSON.parse(match[1]);
-    return normalizeBrowserActionRequest(parsed);
-  } catch (error) {
-    return null;
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      const normalized = normalizeBrowserActionRequest(parsed);
+      if (normalized) {
+        return normalized;
+      }
+    } catch (error) {
+      continue;
+    }
   }
+
+  return null;
 }
 
 function normalizeBrowserActionRequest(value) {
@@ -1249,29 +1677,26 @@ function normalizeBrowserActionRequest(value) {
   }
 
   const normalized = { action };
-  const targetSource =
-    value.target && typeof value.target === "object" ? value.target : value;
-  const elementId =
-    typeof targetSource.elementId === "string"
-      ? targetSource.elementId.trim()
-      : "";
-  const selector =
-    typeof targetSource.selector === "string"
-      ? targetSource.selector.trim()
-      : "";
-
-  if (elementId || selector) {
-    normalized.target = {};
-    if (elementId) {
-      normalized.target.elementId = elementId;
-    }
-    if (selector) {
-      normalized.target.selector = selector;
-    }
+  const target = normalizeBrowserActionTargetInput(
+    Object.prototype.hasOwnProperty.call(value, "target") ? value.target : value,
+  );
+  if (target) {
+    normalized.target = target;
   }
 
   if (typeof value.text === "string") {
     normalized.text = value.text;
+  }
+  if (typeof value.query === "string") {
+    normalized.query = value.query;
+  }
+  const kinds = normalizeBrowserActionKindsInput(value.kinds);
+  if (kinds.length > 0) {
+    normalized.kinds = kinds;
+  }
+  const limit = normalizeBrowserActionLimitInput(value.limit);
+  if (limit !== null) {
+    normalized.limit = limit;
   }
   if (value.clear === false) {
     normalized.clear = false;
@@ -1283,14 +1708,85 @@ function normalizeBrowserActionRequest(value) {
   return normalized;
 }
 
+function normalizeBrowserActionKindsInput(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return Array.from(
+    new Set(
+      value
+        .map((entry) =>
+          typeof entry === "string" ? entry.trim().toLowerCase() : "",
+        )
+        .filter(Boolean),
+    ),
+  ).slice(0, 8);
+}
+
+function normalizeBrowserActionLimitInput(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+
+  return Math.max(1, Math.min(20, Math.round(numeric)));
+}
+
+function normalizeBrowserActionTargetInput(value) {
+  if (!value) {
+    return null;
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    if (/^el-\d+$/i.test(trimmed)) {
+      return { elementId: trimmed };
+    }
+
+    return { selector: trimmed };
+  }
+
+  if (typeof value !== "object") {
+    return null;
+  }
+
+  const elementId =
+    typeof value.elementId === "string" ? value.elementId.trim() : "";
+  const selector =
+    typeof value.selector === "string" ? value.selector.trim() : "";
+
+  if (!elementId && !selector) {
+    return null;
+  }
+
+  return {
+    elementId: elementId || undefined,
+    selector: selector || undefined,
+  };
+}
+
 async function loadRemoteHistoryForPage(pageKey, options = {}) {
   const { force = false } = options;
-  const session = state.pageSessions[pageKey];
+  const threadId =
+    typeof options.threadId === "string" && options.threadId
+      ? options.threadId
+      : getActiveThreadId(pageKey);
+  const session = getPageSessionThread(pageKey, threadId);
   if (!session?.sessionId) {
     return;
   }
 
-  const currentStatus = state.historySyncStatus[pageKey];
+  const threadStorageKey = buildThreadStorageKey(pageKey, threadId);
+  const currentStatus = state.historySyncStatus[threadStorageKey];
   if (!force) {
     if (currentStatus === "loading" || currentStatus === "synced") {
       return;
@@ -1300,20 +1796,20 @@ async function loadRemoteHistoryForPage(pageKey, options = {}) {
     }
   }
 
-  if (state.historySyncPromises[pageKey]) {
-    return state.historySyncPromises[pageKey];
+  if (state.historySyncPromises[threadStorageKey]) {
+    return state.historySyncPromises[threadStorageKey];
   }
 
   const apiUrl = buildSessionHistoryUrl(
     state.config.gatewayWsUrl,
     session.sessionId,
   );
-  state.historySyncStatus[pageKey] = "loading";
+  state.historySyncStatus[threadStorageKey] = "loading";
 
   const promise = fetch(apiUrl)
     .then(async (response) => {
       if (response.status === 404 || response.status === 405) {
-        state.historySyncStatus[pageKey] = "unsupported";
+        state.historySyncStatus[threadStorageKey] = "unsupported";
         return;
       }
       if (!response.ok) {
@@ -1324,31 +1820,243 @@ async function loadRemoteHistoryForPage(pageKey, options = {}) {
       const remoteMessages = mapSessionDetailToMessages(detail);
       state.remoteHistories = {
         ...state.remoteHistories,
-        [pageKey]: remoteMessages,
+        [threadStorageKey]: remoteMessages,
       };
-      state.historySyncStatus[pageKey] = "synced";
+      state.historySyncStatus[threadStorageKey] = "synced";
 
-      if (pageKey === state.activePageKey) {
+      if (threadStorageKey === getActiveThreadStorageKey()) {
         renderMessages();
       }
     })
     .catch((error) => {
-      state.historySyncStatus[pageKey] = "unsupported";
+      state.historySyncStatus[threadStorageKey] = "unsupported";
       console.debug("Session history API unavailable, using local cache", error);
     })
     .finally(() => {
-      delete state.historySyncPromises[pageKey];
+      delete state.historySyncPromises[threadStorageKey];
     });
 
-  state.historySyncPromises[pageKey] = promise;
+  state.historySyncPromises[threadStorageKey] = promise;
   return promise;
 }
 
-function getActivePageSession() {
-  if (!state.activePageKey) {
+function getPageSessionScope(pageKey) {
+  if (!pageKey) {
     return null;
   }
-  return state.pageSessions[state.activePageKey] || null;
+  return state.pageSessions[pageKey] || null;
+}
+
+function getPageSessionThread(pageKey, threadId) {
+  const scope = getPageSessionScope(pageKey);
+  if (!scope || !threadId) {
+    return null;
+  }
+  return scope.threads?.[threadId] || null;
+}
+
+function getPageSessionThreads(pageKey) {
+  const scope = getPageSessionScope(pageKey);
+  const threads = scope?.threads ? Object.values(scope.threads) : [];
+  return threads.sort((left, right) => right.updatedAt - left.updatedAt);
+}
+
+function getActiveThreadId(pageKey = state.activePageKey) {
+  const scope = getPageSessionScope(pageKey);
+  if (!scope) {
+    return "";
+  }
+  if (scope.activeThreadId && scope.threads?.[scope.activeThreadId]) {
+    return scope.activeThreadId;
+  }
+  return Object.keys(scope.threads || {})[0] || "";
+}
+
+function getActiveThreadForPage(pageKey = state.activePageKey) {
+  return getPageSessionThread(pageKey, getActiveThreadId(pageKey));
+}
+
+function getActivePageSession() {
+  return getActiveThreadForPage(state.activePageKey);
+}
+
+function buildThreadStorageKey(pageKey, threadId = getActiveThreadId(pageKey)) {
+  if (!pageKey || !threadId) {
+    return "";
+  }
+  return `${pageKey}|thread:${threadId}`;
+}
+
+function getActiveThreadStorageKey() {
+  return buildThreadStorageKey(state.activePageKey);
+}
+
+function createThreadRecord(seed = {}) {
+  const threadId =
+    typeof seed.threadId === "string" && seed.threadId
+      ? seed.threadId
+      : crypto.randomUUID();
+  const messages = Array.isArray(seed.messages)
+    ? seed.messages
+        .filter(
+          (message) =>
+            message &&
+            typeof message.id === "string" &&
+            typeof message.role === "string",
+        )
+        .map((message) => ({
+          id: message.id,
+          role: message.role,
+          content: typeof message.content === "string" ? message.content : "",
+          timestamp: normalizeTimestamp(message.timestamp),
+        }))
+        .slice(-MAX_LOCAL_MESSAGES_PER_SESSION)
+    : [];
+
+  return {
+    threadId,
+    sessionId:
+      typeof seed.sessionId === "string" && seed.sessionId
+        ? seed.sessionId
+        : crypto.randomUUID(),
+    title:
+      typeof seed.title === "string" && seed.title.trim()
+        ? seed.title.trim()
+        : DEFAULT_THREAD_TITLE,
+    messages,
+    createdAt: normalizeTimestamp(seed.createdAt || seed.updatedAt),
+    updatedAt: normalizeTimestamp(seed.updatedAt),
+  };
+}
+
+function deriveThreadTitleFromMessage(content) {
+  const normalized = String(content || "").replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return DEFAULT_THREAD_TITLE;
+  }
+  return truncateText(normalized, 42);
+}
+
+function isDefaultThreadTitle(title) {
+  return !title || title === DEFAULT_THREAD_TITLE;
+}
+
+function buildThreadOptionLabel(thread) {
+  const timeLabel = new Date(thread.updatedAt).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  return `${thread.title} • ${timeLabel}`;
+}
+
+function buildThreadExportFilename(scope, thread) {
+  const host = extractHostname(scope?.url || "");
+  const timestamp = formatExportTimestamp(new Date());
+  const titleSlug = slugifyForFilename(thread?.title || "");
+  const parts = [
+    "browsevibe",
+    host || "page",
+    titleSlug || "chat",
+    thread?.threadId?.slice(0, 8) || "thread",
+    timestamp,
+  ].filter(Boolean);
+  return `${parts.join("-")}.json`;
+}
+
+function extractHostname(value) {
+  try {
+    return new URL(String(value || "")).hostname.replace(/\./g, "-");
+  } catch (error) {
+    return "";
+  }
+}
+
+function formatExportTimestamp(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+  return `${year}${month}${day}-${hours}${minutes}${seconds}`;
+}
+
+function slugifyForFilename(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32);
+}
+
+function downloadJsonFile(filename, value) {
+  const blob = new Blob([`${JSON.stringify(value, null, 2)}\n`], {
+    type: "application/json",
+  });
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => {
+    URL.revokeObjectURL(objectUrl);
+  }, 0);
+}
+
+async function createNewThreadForPage(pageKey) {
+  const scope = getPageSessionScope(pageKey);
+  if (!scope) {
+    return;
+  }
+
+  const thread = createThreadRecord();
+  state.pageSessions = {
+    ...state.pageSessions,
+    [pageKey]: {
+      ...scope,
+      activeThreadId: thread.threadId,
+      threads: {
+        ...scope.threads,
+        [thread.threadId]: thread,
+      },
+      updatedAt: Date.now(),
+    },
+  };
+  schedulePageSessionsSave();
+
+  await setActiveThreadForPage(pageKey, thread.threadId);
+}
+
+async function setActiveThreadForPage(pageKey, threadId) {
+  const scope = getPageSessionScope(pageKey);
+  if (!scope?.threads?.[threadId]) {
+    return;
+  }
+
+  state.pageSessions = {
+    ...state.pageSessions,
+    [pageKey]: {
+      ...scope,
+      activeThreadId: threadId,
+      updatedAt: Date.now(),
+    },
+  };
+  schedulePageSessionsSave();
+
+  if (pageKey === state.activePageKey) {
+    renderThreadControls();
+    renderSession();
+    renderMessages();
+    renderTyping();
+    renderPendingBrowserAction();
+    updateConnectionStateForActivePage();
+    void loadRemoteHistoryForPage(pageKey, { threadId });
+    if (state.shouldMaintainConnections) {
+      void ensureSocketForPage(pageKey, { threadId });
+    }
+  }
 }
 
 function buildPageSessionKey(context) {
@@ -1358,10 +2066,27 @@ function buildPageSessionKey(context) {
 
   const tabId =
     typeof context.tabId === "number" ? context.tabId : "unknown-tab";
-  const normalizedUrl = normalizePageUrl(
+  const sessionScope = buildPageSessionScope(
     context.url || context.canonicalUrl || "",
   );
-  return `tab:${tabId}|url:${normalizedUrl || "unknown-url"}`;
+  return `tab:${tabId}|scope:${sessionScope || "unknown-scope"}`;
+}
+
+function buildPageSessionScope(value) {
+  const normalizedUrl = normalizePageUrl(value);
+  if (!normalizedUrl) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(normalizedUrl);
+    if (/^https?:$/i.test(parsed.protocol)) {
+      return parsed.origin;
+    }
+    return normalizedUrl;
+  } catch (error) {
+    return normalizedUrl;
+  }
 }
 
 function normalizeStoredPageSessions(value) {
@@ -1373,28 +2098,48 @@ function normalizeStoredPageSessions(value) {
   const normalized = {};
 
   entries.forEach(([pageKey, session]) => {
-    if (!session || typeof session !== "object" || !session.sessionId) {
+    if (!session || typeof session !== "object") {
       return;
     }
 
+    let threads = {};
+    if (session.threads && typeof session.threads === "object") {
+      threads = Object.entries(session.threads).reduce((acc, [threadId, thread]) => {
+        const normalizedThread = createThreadRecord({
+          threadId,
+          ...thread,
+        });
+        if (normalizedThread.sessionId) {
+          acc[normalizedThread.threadId] = normalizedThread;
+        }
+        return acc;
+      }, {});
+    } else if (session.sessionId) {
+      const migratedThread = createThreadRecord({
+        sessionId: String(session.sessionId),
+        title: typeof session.title === "string" ? session.title : DEFAULT_THREAD_TITLE,
+        messages: session.messages,
+        createdAt: session.updatedAt,
+        updatedAt: session.updatedAt,
+      });
+      threads = {
+        [migratedThread.threadId]: migratedThread,
+      };
+    }
+
+    const threadIds = Object.keys(threads);
+    if (threadIds.length === 0) {
+      return;
+    }
+
+    const activeThreadId =
+      typeof session.activeThreadId === "string" && threads[session.activeThreadId]
+        ? session.activeThreadId
+        : threadIds[0];
+
     normalized[pageKey] = {
-      sessionId: String(session.sessionId),
-      messages: Array.isArray(session.messages)
-        ? session.messages
-            .filter(
-              (message) =>
-                message &&
-                typeof message.id === "string" &&
-                typeof message.role === "string",
-            )
-            .map((message) => ({
-              id: message.id,
-              role: message.role,
-              content: typeof message.content === "string" ? message.content : "",
-              timestamp: normalizeTimestamp(message.timestamp),
-            }))
-            .slice(-MAX_LOCAL_MESSAGES_PER_SESSION)
-        : [],
+      activeThreadId,
+      threads,
       tabId:
         typeof session.tabId === "number" ? session.tabId : session.tabId ?? null,
       title: typeof session.title === "string" ? session.title : "",
@@ -1417,6 +2162,12 @@ function schedulePageSessionsSave() {
       [PAGE_SESSIONS_STORAGE_KEY]: state.pageSessions,
     });
   }, SESSION_SAVE_DELAY_MS);
+}
+
+function persistConnectionIntent() {
+  void chrome.storage.local.set({
+    [CONNECTION_INTENT_STORAGE_KEY]: state.shouldMaintainConnections,
+  });
 }
 
 function buildSessionHistoryUrl(baseUrl, sessionId) {
@@ -1576,6 +2327,18 @@ function formatSnapshotElementState(element) {
   }
   parts.push(element.visible ? "visible" : "hidden");
   parts.push(element.enabled ? "enabled" : "disabled");
+  if (element.active) {
+    parts.push("active");
+  }
+  if (element.selected) {
+    parts.push("selected");
+  }
+  if (element.expanded === true) {
+    parts.push("expanded");
+  }
+  if (element.expanded === false) {
+    parts.push("collapsed");
+  }
   if (element.editable) {
     parts.push("editable");
   }
@@ -1604,6 +2367,10 @@ function summarizeBrowserActionRequest(request) {
       return "capture a fresh browser snapshot";
     case "browser.extract":
       return target ? `extract content from ${target}` : "extract page content";
+    case "browser.find":
+      return request.query
+        ? `find page elements matching "${truncateText(request.query, 80)}"`
+        : "find matching page elements";
     case "browser.click":
       return target ? `click ${target}` : "click the page target";
     case "browser.type":
@@ -1641,6 +2408,38 @@ function formatBrowserActionTarget(entryOrTarget) {
   }
 
   return parts.join(" ");
+}
+
+function formatBrowserActionQuery(entryOrRequest) {
+  const query = entryOrRequest?.request?.query || entryOrRequest?.query || "";
+  return typeof query === "string" ? query.trim() : "";
+}
+
+function formatBrowserFindResultsForPrompt(matches) {
+  if (!Array.isArray(matches) || matches.length === 0) {
+    return "";
+  }
+
+  return matches
+    .map((match) => {
+      const parts = [`- ${formatSnapshotElementForPrompt(match)}`];
+      if (match.region) {
+        parts.push(`region: ${match.region}`);
+      }
+      if (Array.isArray(match.ancestors) && match.ancestors.length > 0) {
+        parts.push(
+          `ancestors: ${truncateText(match.ancestors.join(" > "), 140)}`,
+        );
+      }
+      if (typeof match.score === "number") {
+        parts.push(`score ${match.score.toFixed(2)}`);
+      }
+      if (match.selector) {
+        parts.push(`selector: ${truncateText(match.selector, 120)}`);
+      }
+      return parts.join(" • ");
+    })
+    .join("\n");
 }
 
 function describeBrowserActionStatus(entry) {
