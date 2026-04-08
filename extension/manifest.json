@@ -3,6 +3,12 @@
   "name": "BrowseVibe",
   "version": "0.1.0",
   "description": "A browser agent for the web, under your control.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "minimum_chrome_version": "116",
   "permissions": ["activeTab", "sidePanel", "storage", "tabs"],
   "host_permissions": [
@@ -16,7 +22,12 @@
     "type": "module"
   },
   "action": {
-    "default_title": "Open BrowseVibe"
+    "default_title": "Open BrowseVibe",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png"
+    }
   },
   "side_panel": {
     "default_path": "sidebar.html"
